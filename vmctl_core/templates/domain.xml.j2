@@ -1,0 +1,249 @@
+{%- if hw.arch == 'ppc' -%}
+{# ---- PowerPC / mac99 (Mac OS 9, screamer-audio fork) ----------------------- #}
+{# TCG (no KVM on x86 host for ppc), OpenBIOS (no Mac ROM), <1024 MB RAM. mac99   #}
+{# uses an onboard macio-IDE + sungem NIC + std VGA that libvirt CANNOT express,   #}
+{# so disks/CD/boot-order/NIC/VGA/input + the load-bearing prom-env + screamer     #}
+{# -audiodev ALL ride in <qemu:commandline> (research/33b, research/38).           #}
+{#                                                                                  #}
+{# NIC — the load-bearing detail (PROVEN 2026-06-22 on rvmc-ck1/2/3 + the golden): #}
+{# a managed <interface model='sungem'> is WRONG. libvirt always lands a managed   #}
+{# interface on a PCI bus (AGP / pci.0); OS 9 Open Transport cannot bind sungem    #}
+{# there → the NIC never appears → no DHCP. The working form is a RAW cmdline NIC  #}
+{# with NO bus/addr: qemu then auto-places sungem on pci.2 (the uni-north main bus #}
+{# where macio lives), exactly where OS 9 binds "Ethernet (built-in)". The tap is  #}
+{# a per-instance device ({{ tap }}) created on virbr0 by clone.py BEFORE define,   #}
+{# owned by the qemu user (qemu.conf namespaces=[] + /dev/net/tun in              #}
+{# cgroup_device_acl). domifaddr CANNOT see a qemu:commandline NIC, so guest_ip()  #}
+{# discovers the lease by parsing dnsmasq/virbr0.status by MAC (libvirt_backend).  #}
+<domain type='qemu' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>{{ name }}</name>
+  <uuid>{{ uuid }}</uuid>
+  <title>{{ title }}</title>
+  <memory unit='MiB'>{{ hw.memory_mb }}</memory>
+  <currentMemory unit='MiB'>{{ hw.memory_mb }}</currentMemory>
+  <vcpu placement='static'>{{ hw.vcpus }}</vcpu>
+  <os>
+    <type arch='ppc' machine='{{ hw.machine }}'>hvm</type>
+  </os>
+  {# no <cpu> element: libvirt's CPU driver can't validate ppc models. -cpu g4 via cmdline. #}
+  <clock offset='{{ hw.clock }}'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>{{ emulator }}</emulator>
+    {# NO managed <interface> here: a libvirt-managed sungem lands on a PCI bus OS 9
+       can't bind. The NIC is a raw -netdev tap / -device sungem in <qemu:commandline>
+       (no bus → qemu auto-places it on pci.2 where OS 9 finds it). See header. #}
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    <video>
+      <model type='none'/>
+    </video>
+  </devices>
+  <qemu:commandline>
+    {# libvirt emits -M from <type machine> (it rejects machine='mac99,via=cuda'). We #}
+    {# re-issue -machine via=<via> here so qemu MERGES the via property onto that -M:  #}
+    {# via=pmu => OS X / install default; via=cuda => the OS-9 native-mouse fix path   #}
+    {# (research/48) where the Elliot-Nunn nvramrc tablet driver + usb-tablet make the #}
+    {# cursor track 1:1 over noVNC. usb-tablet (absolute) replaces usb-mouse (relative,#}
+    {# offsets over VNC) when hw.usb_tablet is set. The nvramrc blob itself rides in   #}
+    {# hw.prom_env (use-nvramrc?=true + nvramrc=<blob>) — no template change needed.   #}
+    <qemu:arg value='-machine'/>
+    <qemu:arg value='via={{ hw.via }}'/>
+    <qemu:arg value='-cpu'/>
+    <qemu:arg value='{{ hw.cpu_model or 'g4' }}'/>
+    <qemu:arg value='-boot'/>
+    <qemu:arg value='{{ "d" if hw.boot_dev == "cdrom" else "c" }}'/>
+{%- for pe in hw.prom_env %}
+    <qemu:arg value='-prom-env'/>
+    <qemu:arg value='{{ pe }}'/>
+{%- endfor %}
+    {# RAW tap NIC (PROVEN, research/58). NO bus/addr on -device sungem → qemu auto-
+       lands it on pci.2 (uni-north main bus, where macio lives) so OS 9 Open Transport
+       binds "Ethernet (built-in)" and pulls a DHCP lease. The {{ tap }} tap is created
+       on virbr0 by clone.py (owned by the qemu user) BEFORE this domain is defined;
+       script=no/downscript=no so qemu neither (re)creates nor tears down the tap. #}
+    <qemu:arg value='-netdev'/>
+    <qemu:arg value='tap,id=net0,ifname={{ tap }},script=no,downscript=no'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='sungem,netdev=net0,mac={{ mac }}'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='VGA'/>
+    <qemu:arg value='-usb'/>
+    <qemu:arg value='-device'/>
+{%- if hw.usb_tablet %}
+    {# absolute pointer — OS 9 drives it via the nvramrc/INIT tablet driver (research/48) #}
+    <qemu:arg value='usb-tablet'/>
+{%- else %}
+    <qemu:arg value='usb-mouse'/>
+{%- endif %}
+    <qemu:arg value='-device'/>
+    <qemu:arg value='usb-kbd'/>
+    <qemu:arg value='-drive'/>
+    <qemu:arg value='file={{ disk_path }},format=qcow2,media=disk,index=0'/>
+{%- if hw.boot_iso %}
+    <qemu:arg value='-drive'/>
+    <qemu:arg value='file={{ hw.boot_iso }},format=raw,media=cdrom,index=2'/>
+{%- endif %}
+    <qemu:arg value='-audiodev'/>
+{%- if hw.audio_sink %}
+    <qemu:arg value='pa,id=audio1,server={{ pulse_server }},out.name={{ hw.audio_sink }},out.frequency=44100'/>
+{%- else %}
+    {# screamer is auto-added by mac99 + needs an explicit audiodev (default is rejected) #}
+    <qemu:arg value='none,id=audio1'/>
+{%- endif %}
+  </qemu:commandline>
+</domain>
+{%- else -%}
+<domain type='kvm'>
+  <name>{{ name }}</name>
+  <uuid>{{ uuid }}</uuid>
+  <title>{{ title }}</title>
+  <memory unit='MiB'>{{ hw.memory_mb }}</memory>
+  <currentMemory unit='MiB'>{{ hw.memory_mb }}</currentMemory>
+  <vcpu placement='static'>{{ hw.vcpus }}</vcpu>
+  <os>
+    <type arch='{{ hw.arch }}' machine='{{ hw.machine }}'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+{%- if hw.hyperv %}
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+{%- endif %}
+    <vmport state='{{ "on" if hw.vmport else "off" }}'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <clock offset='{{ hw.clock }}'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+{%- if hw.hyperv %}
+    <timer name='hypervclock' present='yes'/>
+{%- endif %}
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>{{ emulator }}</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{{ disk_path }}'/>
+      <target dev='{{ hw.disk_dev }}' bus='{{ hw.disk_bus }}'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <target dev='hdc' bus='ide'/>
+      <readonly/>
+    </disk>
+{%- if hw.virtio_serial %}
+    {#- virtio-serial controller(s). One controller exposes 31 usable ports (port 0 is
+        the console). The channels we may attach are: the qemu guest-agent channel (1)
+        + the agent lane pool (len(agent_socks), research/56). When that total exceeds a
+        single controller we emit extra controllers and pin each channel to one via an
+        explicit <address>. In the common case (<= one controller's worth of channels)
+        we emit a single bare controller and NO per-channel addresses, so an
+        AGENT_LANES=1 (or non-pooled) domain stays byte-for-byte identical to before. -#}
+    {%- set _chan_count = (agent_socks | length) + (1 if hw.virtio_serial else 0) %}
+    {%- set _max = vioser_max_ports | default(31) %}
+    {#- Port 0 on every controller is reserved for the console, so only _max-1 ports
+        per controller are usable — the allocator below fills exactly that many, so
+        _nctrl must divide by the SAME per-controller capacity or it will emit
+        <address controller='N'> for a controller that range(_nctrl) never created. -#}
+    {%- set _cap = _max - 1 %}
+    {%- set _nctrl = ([_chan_count, 1] | max + _cap - 1) // _cap %}
+    {%- if _nctrl < 1 %}{% set _nctrl = 1 %}{% endif %}
+    {%- for ci in range(_nctrl) %}
+    <controller type='virtio-serial' index='{{ ci }}'/>
+    {%- endfor %}
+{%- endif %}
+    <interface type='network'>
+      <mac address='{{ mac }}'/>
+      <source network='{{ network }}'/>
+      <model type='{{ hw.nic_model }}'/>
+    </interface>
+{%- if hw.mgmt_nic %}
+    {#- ADDITIONAL isolated host-only management NIC — containment for the legacy-TCP
+        agent transport (research/68). Guests with no virtio-serial (win2000/win98/
+        irix) run the agentbox on TCP:9009; without this that listener sits on the
+        NIC above, the same NAT network the untrusted artwork uses. This second
+        interface lives on the isolated 'rvmc-mgmt' libvirt network (no <forward>,
+        private 10.77.0.0/24 + DHCP — see deploy/networks/rvmc-mgmt.xml), so :9009 on
+        it is unreachable from the artwork/exhibition LAN. No <mac> here: libvirt
+        auto-assigns one at define time. guest_ip() prefers the 10.77.0.x lease so the
+        controller/tcp_helper dial the mgmt IP. The primary NIC above is unchanged
+        (artwork/internet path); this whole block is skipped when hw.mgmt_nic is false
+        so single-NIC domains stay byte-for-byte identical. -#}
+    <interface type='network'>
+      <source network='rvmc-mgmt'/>
+      <model type='{{ hw.nic_model }}'/>
+    </interface>
+{%- endif %}
+    <serial type='pty'>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+{#- Port allocation across the virtio-serial controller(s). Each unix channel below
+    consumes one port. We only emit an explicit <address> when more than one controller
+    is in play (_nctrl > 1); with a single controller we keep the bare channels so an
+    AGENT_LANES=1 / non-pooled domain is byte-for-byte identical to the old XML. Port 0
+    on each controller is reserved for the console, so usable ports start at 1. -#}
+{%- set _port = namespace(n=1, ctrl=0) %}
+{%- if hw.virtio_serial %}
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+{%- if _nctrl > 1 %}
+      <address type='virtio-serial' controller='{{ _port.ctrl }}' bus='0' port='{{ _port.n }}'/>
+{%- endif %}
+    </channel>
+{%- if _port.n + 1 >= _max %}{% set _port.ctrl = _port.ctrl + 1 %}{% set _port.n = 1 %}{% else %}{% set _port.n = _port.n + 1 %}{% endif %}
+{%- endif %}
+{%- if agent_sock %}
+    {#- Multi-lane agent channel POOL (research/56): N independent single-client vioser
+        lanes — .0 control (status/polls), .1 drive (keys/pointer/screenshot), .2..N-1
+        worker pool (heavy eventlog/log/file/shell/exec/installer, dispatched
+        round-robin host-side) — so a saturated lane can't head-of-line block the
+        others. `agent_socks` is the per-lane bind path list (lane .0 = the legacy
+        `<domain>.sock`); falls back to a single .0 lane when only `agent_sock` is
+        supplied (old callers). Windows/Linux agent guests only — gated by agent_sock,
+        which the controller leaves empty for pristine XP and the agentless mac/ppc
+        bases. Pool size is env AGENT_LANES (default 8); AGENT_LANES=1 => lane .0 only,
+        reproducing the old single-channel XML. -#}
+{%- for sock in (agent_socks or [agent_sock]) %}
+    <channel type='unix'>
+      <source mode='bind' path='{{ sock }}'/>
+      <target type='virtio' name='de.zkm.rvmc.agent.{{ loop.index0 }}'/>
+{%- if _nctrl > 1 %}
+      <address type='virtio-serial' controller='{{ _port.ctrl }}' bus='0' port='{{ _port.n }}'/>
+{%- endif %}
+    </channel>
+{%- if _port.n + 1 >= _max %}{% set _port.ctrl = _port.ctrl + 1 %}{% set _port.n = 1 %}{% else %}{% set _port.n = _port.n + 1 %}{% endif %}
+{%- endfor %}
+{%- endif %}
+{%- if hw.usb_tablet %}
+    <input type='tablet' bus='usb'/>
+{%- endif %}
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    <video>
+{%- if hw.video == 'qxl' %}
+      <model type='qxl' ram='{{ hw.qxl_ram_kib }}' vram='{{ hw.qxl_vram_kib }}' vgamem='{{ hw.vgamem_kib }}' heads='1' primary='yes'/>
+{%- elif hw.video in ['vga', 'cirrus', 'vmvga'] %}
+      <model type='{{ hw.video }}' vram='{{ hw.vgamem_kib }}' heads='1' primary='yes'/>
+{%- else %}
+      <model type='{{ hw.video }}' heads='1' primary='yes'/>
+{%- endif %}
+    </video>
+    <memballoon model='{{ hw.memballoon }}'/>
+  </devices>
+</domain>
+{%- endif %}

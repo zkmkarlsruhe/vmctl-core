@@ -1,0 +1,290 @@
+"""Linked-clone a base image and render its libvirt domain XML.
+
+A clone is a copy-on-write qcow2 overlay backed by the immutable base, plus a
+domain definition derived from the base's hardware hints. Cloning is instant and
+near-zero-disk; resetting an instance to pristine = delete + recreate the overlay.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import uuid as _uuid
+from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from .catalog import BaseImage
+
+_TEMPLATES = Path(__file__).parent / "templates"
+_env = Environment(
+    loader=FileSystemLoader(str(_TEMPLATES)),
+    autoescape=select_autoescape(enabled_extensions=("xml", "j2")),
+    keep_trailing_newline=True,
+)
+
+DEFAULT_EMULATOR = "/usr/bin/qemu-system-x86_64"
+
+
+def random_mac() -> str:
+    """A QEMU-range (52:54:00) locally-administered MAC."""
+    tail = os.urandom(3)
+    return f"52:54:00:{tail[0]:02x}:{tail[1]:02x}:{tail[2]:02x}"
+
+
+# ppc/mac99 NIC is a RAW -netdev tap (research/58): a libvirt-managed <interface>
+# lands the sungem on a PCI bus OS 9 can't bind, so the tap is host-managed instead.
+# The host bridge the tap joins (virbr0 is libvirt's "default" NAT network's bridge,
+# whose dnsmasq leases the per-instance IP guest_ip() later parses).
+PPC_TAP_BRIDGE = "virbr0"
+# The qemu user that must own the tap (qemu.conf user). On the deploy box qemu runs
+# as the deploying user (libvirt session/user-as-qemu, namespaces=[]); see deploy note.
+PPC_TAP_USER = os.environ.get("RVMC_QEMU_USER", "scharc")
+# Linux IFNAMSIZ caps an interface name at 15 chars (+NUL). "os9" + 8 hex of the
+# domain/instance id = 11 chars, comfortably under the limit and per-instance unique.
+_TAP_PREFIX = "os9"
+
+
+def ppc_tap_name(domain_name: str) -> str:
+    """Per-instance tap name for a ppc/mac99 domain. <=15 chars (Linux IFNAMSIZ):
+    "os9" + the first 8 hex of a stable digest of the domain name. Deterministic so
+    the same domain always maps to the same tap (idempotent create + clean delete)."""
+    import hashlib
+
+    h = hashlib.sha1(domain_name.encode("utf-8")).hexdigest()[:8]
+    return f"{_TAP_PREFIX}{h}"
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def create_ppc_tap(tap: str, *, bridge: str = PPC_TAP_BRIDGE, user: str = PPC_TAP_USER) -> None:
+    """Idempotently create a tap on `bridge`, owned by `user`, and bring it up.
+    No-op if the tap already exists. Uses passwordless `sudo ip` (works on the box).
+
+    The raw qemu sungem NIC opens this pre-existing tap (script=no), so it MUST
+    exist + be on the NAT bridge before the domain starts, else qemu fails to open
+    it / the guest never reaches dnsmasq. ppc-only; never called for x86 guests."""
+    # already present? (idempotent — re-clone / restart must not error)
+    if _run(["ip", "link", "show", tap]).returncode == 0:
+        return
+    p = _run(["sudo", "ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", user])
+    if p.returncode != 0:
+        raise CloneError(f"tap create failed for {tap}: {p.stderr.strip()}")
+    up = _run(["sudo", "ip", "link", "set", tap, "up"])
+    if up.returncode != 0:
+        raise CloneError(f"tap up failed for {tap}: {up.stderr.strip()}")
+    enslave = _run(["sudo", "ip", "link", "set", tap, "master", bridge])
+    if enslave.returncode != 0:
+        raise CloneError(f"tap enslave to {bridge} failed for {tap}: {enslave.stderr.strip()}")
+
+
+def delete_ppc_tap(tap: str) -> None:
+    """Remove a per-instance ppc tap (idempotent — best-effort, never raises).
+    Called by the backend on undefine/destroy of a ppc domain."""
+    if not tap:
+        return
+    _run(["sudo", "ip", "link", "del", tap])
+
+
+class CloneError(RuntimeError):
+    pass
+
+
+def make_overlay(base_path: Path, overlay_path: Path) -> None:
+    """Create a qcow2 overlay (CoW) backed by an immutable base. The base is
+    read-only — never written. Pass -F so libvirt accepts the backing format."""
+    base_path = Path(base_path)
+    overlay_path = Path(overlay_path)
+    if not base_path.is_file():
+        raise CloneError(f"base image not found: {base_path}")
+    overlay_path.parent.mkdir(parents=True, exist_ok=True)
+    if overlay_path.exists():
+        overlay_path.unlink()
+    p = subprocess.run(
+        [
+            "qemu-img",
+            "create",
+            "-f",
+            "qcow2",
+            "-b",
+            str(base_path),
+            "-F",
+            "qcow2",
+            str(overlay_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise CloneError(f"qemu-img create failed: {p.stderr.strip()}")
+
+
+def make_blank_disk(disk_path: Path, size_gb: int) -> None:
+    """Create a fresh empty qcow2 (no backing file) of `size_gb` GiB. Used by
+    install/provisioning bases that have no golden image yet — the guest installer
+    partitions+formats this blank disk itself (e.g. Mac OS 9 Drive Setup -> APM/HFS+)."""
+    disk_path = Path(disk_path)
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+    if disk_path.exists():
+        disk_path.unlink()
+    p = subprocess.run(
+        ["qemu-img", "create", "-f", "qcow2", str(disk_path), f"{int(size_gb)}G"],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise CloneError(f"qemu-img create (blank) failed: {p.stderr.strip()}")
+
+
+def resolve_emulator(base: BaseImage, default: str = DEFAULT_EMULATOR) -> str:
+    """Per-base QEMU binary if the catalog pins one (e.g. the ppc/mac99 screamer
+    fork), else the deployment x86 default. Keeps existing x86 bases unchanged."""
+    return base.hw.emulator or default
+
+
+# research/56: the agent channel is a POOL of independent single-client vioser lanes.
+#   .0  control  — status/polls (cheap, must stay responsive)
+#   .1  drive    — keys/pointer/screenshot (fast, high-rate)
+#   .2..N-1      — worker pool: heavy/slow calls (eventlog/log/file/shell/exec/
+#                  installer + unknown) dispatched round-robin across these by the host.
+# Lane .0 keeps the legacy bare `<domain>.sock` (back-compat with single-channel
+# goldens); lanes 1+ get `<domain>.<lane>.sock`. Must match
+# rvmc.guest_bridge.lane_sock_path so the host connects to the right per-lane socket.
+#
+# Configurable via the AGENT_LANES env var (default 1). AGENT_LANES=1 reproduces the
+# old single-channel XML byte-for-byte (lane .0 only).
+#
+# DEFAULT capped at 1 (lane .0 only): emitting >2 virtio-serial
+# ports WEDGES the modern virtio-win driver (win11/win10) — the guest serving 3+ ports
+# concurrently stalls a read_file reply on any lane, so portal PULL timed out there
+# (verified 2026-07-18: win11 pull fails at 8 ports, byte-identical at 1; still timed out at 2). Must stay
+# in sync with rvmc.guest_bridge.DEFAULT_AGENT_LANES.
+DEFAULT_AGENT_LANES = 1
+
+# Usable ports per virtio-serial controller. QEMU's default vioser controller offers
+# 32 ports, port 0 is reserved for the console => 31 usable. If the channel count
+# (qemu-ga + agent lanes) exceeds one controller, the template emits a second.
+VIOSER_MAX_PORTS = 31
+
+
+def _agent_lanes() -> int:
+    """Configured lane-pool size (env AGENT_LANES, default 8, floored at 1)."""
+    try:
+        return max(1, int(os.environ.get("AGENT_LANES", DEFAULT_AGENT_LANES)))
+    except (TypeError, ValueError):
+        return DEFAULT_AGENT_LANES
+
+
+# Back-compat alias: callers / tests that imported the old constant still resolve a
+# concrete int (the configured pool size at import time).
+AGENT_LANES = _agent_lanes()
+
+
+def agent_lane_socks(agent_sock: str, lanes: int | None = None) -> list[str]:
+    """Per-lane bind paths derived from the base lane-.0 socket. `<domain>.sock` for
+    lane 0; `<domain>.<lane>.sock` for lanes 1+. Empty list if no agent channel.
+    `lanes` defaults to the configured pool size (env AGENT_LANES, default 8)."""
+    if not agent_sock:
+        return []
+    if lanes is None:
+        lanes = _agent_lanes()
+    base = Path(agent_sock)
+    out = [str(base)]
+    for lane in range(1, lanes):
+        out.append(
+            str(
+                base.with_suffix(f".{lane}.sock")
+                if base.suffix == ".sock"
+                else Path(str(base) + f".{lane}.sock")
+            )
+        )
+    return out
+
+
+def render_domain_xml(
+    base: BaseImage,
+    *,
+    name: str,
+    disk_path: Path,
+    title: str = "",
+    network: str = "default",
+    emulator: str = DEFAULT_EMULATOR,
+    mac: str | None = None,
+    domain_uuid: str | None = None,
+    agent_sock: str = "",
+    pulse_server: str = "",
+) -> str:
+    # A base may pin its own emulator (ppc screamer fork); it wins over the
+    # deployment x86 default passed in. x86 bases leave hw.emulator unset => default.
+    emulator = resolve_emulator(base, emulator)
+    return _env.get_template("domain.xml.j2").render(
+        name=name,
+        uuid=domain_uuid or str(_uuid.uuid4()),
+        title=title or name,
+        hw=base.hw,
+        disk_path=str(disk_path),
+        network=network,
+        emulator=emulator,
+        mac=mac or random_mac(),
+        # Per-instance host-managed tap for the ppc/mac99 raw sungem NIC. Only the
+        # ppc branch of the template consumes it; x86 branches ignore it entirely.
+        tap=ppc_tap_name(name) if base.hw.arch == "ppc" else "",
+        agent_sock=agent_sock,
+        # Multi-lane pool (research/56): emit N agent channels (env AGENT_LANES,
+        # default 8). Lane .0 == agent_sock so old single-channel goldens are
+        # byte-for-byte unaffected when AGENT_LANES drops to 1.
+        agent_socks=agent_lane_socks(agent_sock),
+        # A single virtio-serial controller exposes 31 usable ports (port 0 reserved
+        # for the console). With the qemu guest-agent channel + N agent lanes a large
+        # pool could exceed that, so tell the template how many controllers to emit.
+        vioser_max_ports=VIOSER_MAX_PORTS,
+        pulse_server=pulse_server,
+    )
+
+
+def clone_base(
+    base: BaseImage,
+    *,
+    catalog_dir: Path,
+    domain_name: str,
+    overlays_dir: Path,
+    xml_dir: Path,
+    network: str = "default",
+    emulator: str = DEFAULT_EMULATOR,
+    agent_sock: str = "",
+    pulse_server: str = "",
+) -> tuple[Path, Path]:
+    """Make the overlay + write the domain XML. Returns (overlay_path, xml_path).
+    Does NOT define/start — the caller drives the backend."""
+    # ppc/mac99 NIC is a raw host-managed tap (not a libvirt-managed interface): it
+    # MUST exist on the NAT bridge, owned by the qemu user, before the domain is
+    # defined+started. Create it here (idempotent). x86 guests skip this entirely —
+    # libvirt creates+owns their tap automatically. (research/58)
+    if base.hw.arch == "ppc":
+        create_ppc_tap(ppc_tap_name(domain_name))
+
+    overlay_path = Path(overlays_dir) / f"{domain_name}.qcow2"
+    if base.hw.blank_disk_gb > 0:
+        # No golden base yet (install/provision VM): the guest installer formats a
+        # fresh empty disk itself. Skip the CoW overlay.
+        make_blank_disk(overlay_path, base.hw.blank_disk_gb)
+    else:
+        base_path = base.resolved_path(Path(catalog_dir))
+        make_overlay(base_path, overlay_path)
+
+    xml = render_domain_xml(
+        base,
+        name=domain_name,
+        disk_path=overlay_path,
+        title=domain_name,
+        network=network,
+        emulator=emulator,
+        agent_sock=agent_sock,
+        pulse_server=pulse_server,
+    )
+    Path(xml_dir).mkdir(parents=True, exist_ok=True)
+    xml_path = Path(xml_dir) / f"{domain_name}.xml"
+    xml_path.write_text(xml)
+    return overlay_path, xml_path

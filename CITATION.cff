@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "vmctl Core"
+abstract: "Shared library for the vmctl born-digital-art conservation platform: the artwork-drive schema, base-image catalog, plugin specification, and pluggable VM backends. Developed by ZKM | Center for Art and Media Karlsruhe, building upon research conducted at Karlsruhe Institute of Technology (KIT)."
+authors:
+  - family-names: "Schütze"
+    given-names: "Marc"
+    email: "mschuetze@zkm.de"
+    affiliation: "ZKM | Center for Art and Media Karlsruhe"
+    orcid: "https://orcid.org/0009-0007-0718-4251"
+repository-code: "https://github.com/zkmkarlsruhe/vmctl-core"
+url: "https://github.com/zkmkarlsruhe/vmctl-core"
+keywords:
+  - "digital art conservation"
+  - "software preservation"
+  - "libvirt"
+  - "virtual machines"
+  - "shared library"
+license: MIT
+references:
+  - type: grant
+    title: "Underlying research funded by German Research Foundation (DFG)"
+  - type: grant
+    title: "Underlying research funded by European Research Council (ERC) under Horizon 2020 (grant agreement COSE, No. 101045376)"
+version: "1.0.0"
+date-released: "2026-07-24"

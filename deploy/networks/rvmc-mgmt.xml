@@ -1,0 +1,30 @@
+<!--
+  rvmc-mgmt: isolated host-only libvirt network for the legacy-TCP agent transport.
+
+  Containment for guests with no virtio-serial (win2000 / win98 / irix), whose
+  agentbox listens on TCP:9009. Those bases set hw.mgmt_nic=true, so domain.xml.j2
+  gives them a SECOND NIC on this network in addition to their normal artwork/NAT
+  NIC. The controller/tcp_helper reach :9009 over THIS subnet (guest_ip() prefers a
+  10.77.0.x lease when the domain has a mgmt NIC).
+
+  This network is deliberately ISOLATED: there is NO <forward> element, so libvirt
+  creates the bridge + a dnsmasq for DHCP but adds NO NAT/routing. Guests on it can
+  talk to the host (10.77.0.1) and each other, but NOT to the exhibition/artwork LAN
+  or the internet — so :9009 is unreachable from the untrusted artwork network.
+
+  Deploy on the rvmc host (does NOT touch running VMs):
+    virsh net-define   deploy/networks/rvmc-mgmt.xml
+    virsh net-autostart rvmc-mgmt
+    virsh net-start     rvmc-mgmt
+
+  Do NOT add a <forward> element here — that would defeat the containment.
+-->
+<network>
+  <name>rvmc-mgmt</name>
+  <bridge name='rvmc-mgmt0' stp='on' delay='0'/>
+  <ip address='10.77.0.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='10.77.0.2' end='10.77.0.254'/>
+    </dhcp>
+  </ip>
+</network>

@@ -1,0 +1,53 @@
+{
+  "@context": "https://doi.org/10.5063/schema/codemeta-2.0",
+  "@type": "SoftwareSourceCode",
+  "name": "vmctl Core",
+  "description": "Shared library for the vmctl born-digital-art conservation platform: the artwork-drive schema, base-image catalog, plugin specification, and pluggable VM backends.",
+  "codeRepository": "https://github.com/zkmkarlsruhe/vmctl-core",
+  "license": "https://spdx.org/licenses/MIT",
+  "version": "1.0.0",
+  "datePublished": "2026-07-24",
+  "dateModified": "2026-07-24",
+  "author": [
+    {
+      "@type": "Person",
+      "givenName": "Marc",
+      "familyName": "Schütze",
+      "email": "mschuetze@zkm.de",
+      "affiliation": {
+        "@type": "Organization",
+        "name": "ZKM | Center for Art and Media Karlsruhe"
+      },
+      "@id": "https://orcid.org/0009-0007-0718-4251"
+    }
+  ],
+  "maintainer": [
+    {
+      "@type": "Person",
+      "givenName": "Marc",
+      "familyName": "Schütze",
+      "email": "mschuetze@zkm.de",
+      "affiliation": {
+        "@type": "Organization",
+        "name": "ZKM | Center for Art and Media Karlsruhe"
+      }
+    }
+  ],
+  "funder": [
+    {
+      "@type": "Organization",
+      "name": "Deutsche Forschungsgemeinschaft (DFG)"
+    },
+    {
+      "@type": "Organization",
+      "name": "European Research Council (ERC), European Union Horizon 2020 (grant agreement COSE, No. 101045376)"
+    }
+  ],
+  "keywords": [
+    "digital art conservation",
+    "software preservation",
+    "libvirt",
+    "virtual machines",
+    "shared library"
+  ]
+}

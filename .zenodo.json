@@ -1,0 +1,25 @@
+{
+  "title": "vmctl Core",
+  "description": "Shared library for the vmctl born-digital-art conservation platform: the artwork-drive schema, base-image catalog, plugin specification, and pluggable VM backends. Developed at ZKM | Center for Art and Media Karlsruhe.",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Schütze, Marc",
+      "affiliation": "ZKM | Center for Art and Media Karlsruhe",
+      "orcid": "0009-0007-0718-4251"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "digital art conservation",
+    "software preservation",
+    "libvirt",
+    "virtual machines",
+    "shared library"
+  ],
+  "grants": [
+    {
+      "id": "10.13039/501100000780::101045376"
+    }
+  ]
+}

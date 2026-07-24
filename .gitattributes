@@ -1,0 +1,2 @@
+# Internal dev/CI files — kept in the private source, EXCLUDED from any public git-archive mirror.
+.gitlab-ci.yml export-ignore
