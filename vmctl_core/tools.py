@@ -19,6 +19,7 @@ import hashlib
 import json
 import re
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -29,6 +30,30 @@ from .atomicio import write_text_atomic
 def _now() -> str:
     """ISO-8601 local timestamp (matches the controller's audit.log format)."""
     return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _safe_segment(seg: str, *, field: str) -> str:
+    """Guard one path SEGMENT of a tool's on-disk location (os / runtime / version).
+
+    Mirrors drive.py's ``ArtworkDrive.create`` id guard: a segment must be a bare name
+    with no separators and no ``.``/``..``, so an interpolated value like ``os="../../etc"``
+    can't climb out of the tools root when we build ``<root>/<os>/<runtime>/<version>``."""
+    if not seg or seg in (".", "..") or seg != Path(seg).name:
+        raise ValueError(f"{field} must be a bare path segment, got {seg!r}")
+    return seg
+
+
+def _confined_path(root: Path, rel: str) -> Path:
+    """Resolve ``root/rel`` and confine it under ``root``; raise on escape.
+
+    ``rel`` is a tool's catalogued ``path``. It is trusted-ish input, but a poisoned
+    catalog.json entry (e.g. ``path="../../../home/scharc/.ssh/id_ed25519"``) would let a
+    load/use/unlink reach outside the tools root. Reject anything that resolves outside."""
+    base = root.resolve()
+    target = (root / rel).resolve()
+    if target != base and not target.is_relative_to(base):
+        raise ValueError(f"tool path {rel!r} escapes the tools root {base}")
+    return target
 
 
 # Guest-OS taxonomy for tool compatibility. Aligned with the base-image catalog's
@@ -359,27 +384,43 @@ class ToolsLibrary:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._catalog = self.root / "catalog.json"
+        # ToolsLibrary is a shared singleton mutated concurrently from the controllers'
+        # FastAPI sync-handler threadpool (register/update/add_event/delete/add_file all
+        # mutate self.tools then save). A REENTRANT lock guards every mutate+save AND every
+        # read that iterates the shared dict: without it two overlapping mutate→save pairs
+        # interleave and the later os.replace() writes a snapshot missing the other's change
+        # (silent lost update), and a read iterating while a write pops/adds can raise
+        # "dict changed size during iteration". Reentrant so a mutator can call save()/register()
+        # (which also take the lock) without deadlocking. Mirrors project.Registry.
+        self._lock = threading.RLock()
         self.tools: dict[str, Tool] = {}
         self.load()
 
     def load(self) -> None:
-        if self._catalog.exists():
-            data = json.loads(self._catalog.read_text())
-            # Tolerate older catalogs that predate a field (e.g. os_compat): keep
-            # only keys Tool knows, and let dataclass defaults fill the rest.
-            known = set(Tool.__dataclass_fields__)
-            self.tools = {
-                t["id"]: Tool(**{k: v for k, v in t.items() if k in known})
-                for t in data.get("tools", [])
-            }
+        with self._lock:
+            if self._catalog.exists():
+                data = json.loads(self._catalog.read_text())
+                # Tolerate older catalogs that predate a field (e.g. os_compat): keep
+                # only keys Tool knows, and let dataclass defaults fill the rest.
+                known = set(Tool.__dataclass_fields__)
+                tools: dict[str, Tool] = {}
+                for t in data.get("tools", []):
+                    tool = Tool(**{k: v for k, v in t.items() if k in known})
+                    # Reject a poisoned entry whose path escapes the tools root before it
+                    # can ever be handed to abs_path()/delete() and reach outside.
+                    if tool.path:
+                        _confined_path(self.root, tool.path)
+                    tools[tool.id] = tool
+                self.tools = tools
 
     def save(self) -> None:
         # catalog.json is the source of truth — write atomically so a crash mid-write
         # can't leave a truncated file that fails to parse on the next load().
-        write_text_atomic(
-            self._catalog,
-            json.dumps({"tools": [asdict(t) for t in self.tools.values()]}, indent=2),
-        )
+        with self._lock:
+            write_text_atomic(
+                self._catalog,
+                json.dumps({"tools": [asdict(t) for t in self.tools.values()]}, indent=2),
+            )
 
     def list(
         self,
@@ -423,19 +464,27 @@ class ToolsLibrary:
                 return False
             return not (needle and needle not in f"{t.id} {t.name} {t.notes}".lower())
 
-        return [t for t in self.tools.values() if keep(t)]
+        with self._lock:
+            return [t for t in self.tools.values() if keep(t)]
 
     def get(self, tool_id: str) -> Tool:
-        return self.tools[tool_id]
+        with self._lock:
+            return self.tools[tool_id]
 
     def abs_path(self, tool_id: str) -> Path:
-        return self.root / self.tools[tool_id].path
+        with self._lock:
+            # Confine the catalogued path under root — a poisoned entry must not resolve
+            # (and then get read/written/unlinked) outside the tools box.
+            return _confined_path(self.root, self.tools[tool_id].path)
 
     def register(self, tool: Tool) -> Tool:
         """Add/replace a catalog entry (metadata). Use add_file to also import a binary."""
-        self.tools[tool.id] = tool
-        self.save()
-        return tool
+        with self._lock:
+            if tool.path:
+                _confined_path(self.root, tool.path)  # reject an escaping path on write
+            self.tools[tool.id] = tool
+            self.save()
+            return tool
 
     # --- research/65 §B: the dependency / Technical-Environment resolver -------
     # The flat catalog + Tool.relations form a graph. These read-only methods turn a
@@ -463,53 +512,59 @@ class ToolsLibrary:
                     return True
             return False
 
-        return [t for t in self.tools.values() if hit(t)]
+        with self._lock:
+            return [t for t in self.tools.values() if hit(t)]
 
     def technical_environment(self, tool_id: str) -> dict:
         """The runnable stack for one tool: its OS band, the recursive depends_on chain,
         conservation quirks (network-bootstrap / known-CVE / notes), and alternatives.
         A dependency `target_id` that isn't in the catalog is still listed (a known gap)."""
-        t = self.tools[tool_id]  # KeyError -> 404 at the API layer
-        deps: builtins.list[dict] = []
-        seen: set[str] = {tool_id}
+        with self._lock:
+            t = self.tools[tool_id]  # KeyError -> 404 at the API layer
+            deps: builtins.list[dict] = []
+            seen: set[str] = {tool_id}
 
-        def walk(tid: str) -> None:
-            node = self.tools.get(tid)
-            if node is None:
-                return
-            for r in node.relations:
-                if r.get("rel") != "depends_on":
-                    continue
-                dep = r.get("target_id") or r.get("target")
-                if not dep or dep in seen:
-                    continue
-                seen.add(dep)
-                deps.append({"id": dep, "note": r.get("note", ""), "in_catalog": dep in self.tools})
-                walk(dep)
+            def walk(tid: str) -> None:
+                node = self.tools.get(tid)
+                if node is None:
+                    return
+                for r in node.relations:
+                    if r.get("rel") != "depends_on":
+                        continue
+                    dep = r.get("target_id") or r.get("target")
+                    if not dep or dep in seen:
+                        continue
+                    seen.add(dep)
+                    deps.append(
+                        {"id": dep, "note": r.get("note", ""), "in_catalog": dep in self.tools}
+                    )
+                    walk(dep)
 
-        walk(tool_id)
-        quirks: builtins.list[str] = []
-        if t.network_required or t.install_mode == "network-bootstrap":
-            quirks.append(
-                "network-bootstrap installer — vendor URLs may be dead; host payload locally"
-            )
-        if t.known_cves:
-            quirks.append(f"keep the guest OFFLINE — {len(t.known_cves)} known unpatched CVE(s)")
-        alternatives = [
-            (r.get("target_id") or r.get("target"))
-            for r in t.relations
-            if r.get("rel") == "alternative_to"
-        ]
-        return {
-            "tool": tool_id,
-            "name": t.name,
-            "present": t.present,
-            "os_compat": list(t.os_compat),
-            "install": t.install_mode,
-            "depends_on": deps,
-            "alternatives": [a for a in alternatives if a],
-            "quirks": quirks,
-        }
+            walk(tool_id)
+            quirks: builtins.list[str] = []
+            if t.network_required or t.install_mode == "network-bootstrap":
+                quirks.append(
+                    "network-bootstrap installer — vendor URLs may be dead; host payload locally"
+                )
+            if t.known_cves:
+                quirks.append(
+                    f"keep the guest OFFLINE — {len(t.known_cves)} known unpatched CVE(s)"
+                )
+            alternatives = [
+                (r.get("target_id") or r.get("target"))
+                for r in t.relations
+                if r.get("rel") == "alternative_to"
+            ]
+            return {
+                "tool": tool_id,
+                "name": t.name,
+                "present": t.present,
+                "os_compat": list(t.os_compat),
+                "install": t.install_mode,
+                "depends_on": deps,
+                "alternatives": [a for a in alternatives if a],
+                "quirks": quirks,
+            }
 
     def resolve(
         self,
@@ -524,18 +579,19 @@ class ToolsLibrary:
         Ranks OS-matching first, then present-on-disk, then most-complete. Never filters
         the OS mismatch OUT (returns it ranked lower) so the analyst still sees a tool
         that reads the format even if the era isn't perfect."""
-        cands = self.reads(mime=mime, ext=ext, puid=puid)
-        cands.sort(
-            key=lambda t: (
-                not t.matches_os(os) if os else False,
-                not t.present,
-                -t.completeness(),
+        with self._lock:
+            cands = self.reads(mime=mime, ext=ext, puid=puid)
+            cands.sort(
+                key=lambda t: (
+                    not t.matches_os(os) if os else False,
+                    not t.present,
+                    -t.completeness(),
+                )
             )
-        )
-        return [
-            {**self.technical_environment(t.id), "os_match": t.matches_os(os) if os else None}
-            for t in cands
-        ]
+            return [
+                {**self.technical_environment(t.id), "os_match": t.matches_os(os) if os else None}
+                for t in cands
+            ]
 
     # --- CRUD on existing entries ----------------------------------------
     # Editable metadata fields (everything except the file-derived identity:
@@ -599,43 +655,50 @@ class ToolsLibrary:
         caller can't silently corrupt the path/sha binding. Records an `edited`
         provenance event naming the changed fields. Raises KeyError if unknown.
         """
-        t = self.tools[tool_id]  # KeyError -> 404 at the API layer
-        changed: list[str] = []
-        for k, v in fields.items():
-            if v is None or k not in self.EDITABLE:
-                continue
-            new = list(v) if k in self.LIST_FIELDS else v
-            if k == "category":
-                new = coerce_category(v)  # category is a scalar str field, not a LIST_FIELD
-            if getattr(t, k) != new:
-                setattr(t, k, new)
-                changed.append(k)
-        if "verified" in changed and t.verified:
-            t.verified_at = _now()
-        if changed:
-            t.log_event("edited", by=by, note=", ".join(changed))
-        self.save()
-        return t
+        with self._lock:
+            t = self.tools[tool_id]  # KeyError -> 404 at the API layer
+            changed: list[str] = []
+            for k, v in fields.items():
+                if v is None or k not in self.EDITABLE:
+                    continue
+                new = list(v) if k in self.LIST_FIELDS else v
+                if k == "category":
+                    new = coerce_category(v)  # category is a scalar str field, not a LIST_FIELD
+                if getattr(t, k) != new:
+                    setattr(t, k, new)
+                    changed.append(k)
+            if "verified" in changed and t.verified:
+                t.verified_at = _now()
+            if changed:
+                t.log_event("edited", by=by, note=", ".join(changed))
+            self.save()
+            return t
 
     def add_event(
         self, tool_id: str, action: str, *, by: str = "?", note: str = "", **extra
     ) -> Tool:
         """Append a free-form provenance event (e.g. a re-verification, a note)."""
-        t = self.tools[tool_id]  # KeyError -> 404 at the API layer
-        t.log_event(action, by=by, note=note, **extra)
-        self.save()
-        return t
+        with self._lock:
+            t = self.tools[tool_id]  # KeyError -> 404 at the API layer
+            t.log_event(action, by=by, note=note, **extra)
+            self.save()
+            return t
 
     def delete(self, tool_id: str, *, remove_file: bool = False) -> Tool:
         """Drop a catalog entry. With remove_file, also unlink the binary on disk
         (best-effort; the catalog is the source of truth and is always updated).
         Returns the removed Tool. Raises KeyError if unknown."""
-        t = self.tools.pop(tool_id)  # KeyError -> 404 at the API layer
-        if remove_file and t.path:
-            with contextlib.suppress(OSError):
-                (self.root / t.path).unlink(missing_ok=True)
-        self.save()
-        return t
+        with self._lock:
+            t = self.tools[tool_id]  # KeyError -> 404 at the API layer
+            # Resolve+confine BEFORE popping so a poisoned path that escapes root raises
+            # instead of unlinking outside the box (and leaves the catalog untouched).
+            target = _confined_path(self.root, t.path) if (remove_file and t.path) else None
+            self.tools.pop(tool_id)
+            if target is not None:
+                with contextlib.suppress(OSError):
+                    target.unlink(missing_ok=True)
+            self.save()
+            return t
 
     def add_file(
         self,
@@ -670,7 +733,16 @@ class ToolsLibrary:
         the tool's history with a `catalogued` event.
         """
         src = Path(src)
+        # Confine the location segments: os/runtime/version are interpolated raw into the
+        # on-disk path, so a value like os="../../etc" would escape the tools root. Guard
+        # each as a bare segment (mirrors drive.py's create() id guard), then assert the
+        # assembled dest_dir still resolves under root as belt-and-suspenders.
+        _safe_segment(os, field="os")
+        _safe_segment(runtime, field="runtime")
+        _safe_segment(version, field="version")
         dest_dir = self.root / os / runtime / version
+        if not dest_dir.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError(f"tool dest {dest_dir} escapes the tools root")
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / src.name
         (shutil.move if move else shutil.copy2)(str(src), str(dest))

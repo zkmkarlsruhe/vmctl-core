@@ -8,6 +8,7 @@ for what exists; it persists to ``<state_dir>/registry.json`` and owns the
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -31,76 +32,105 @@ class Registry:
         self.overlays_dir = self.state_dir / "overlays"
         self.xml_dir = self.state_dir / "xml"
         self._path = self.state_dir / "registry.json"
+        # The registry singleton is mutated concurrently from FastAPI's sync-handler threadpool.
+        # A REENTRANT lock guards every mutate+save AND every read that iterates the shared dict:
+        # without it two overlapping mutate→save pairs interleave and the later os.replace() writes
+        # a snapshot missing the other's change (silent lost update), and a read iterating while a
+        # write pops/adds can raise "dict changed size during iteration". Reentrant so a mutator can
+        # call save() (which also takes the lock) without deadlocking.
+        self._lock = threading.RLock()
         self.projects: dict[str, Project] = {}
         self.load()
 
     # --- persistence ------------------------------------------------------
     def load(self) -> None:
-        if self._path.exists():
-            data = json.loads(self._path.read_text())
-            self.projects = {
-                pid: Project(**pdata) for pid, pdata in data.get("projects", {}).items()
-            }
+        with self._lock:
+            if self._path.exists():
+                data = json.loads(self._path.read_text())
+                self.projects = {
+                    pid: Project(**pdata) for pid, pdata in data.get("projects", {}).items()
+                }
 
     def save(self) -> None:
-        data = {"projects": {pid: p.model_dump() for pid, p in self.projects.items()}}
-        # registry.json is the source of truth — atomic write so an interrupted save
-        # can't truncate it and brick load() on the next startup.
-        write_text_atomic(self._path, json.dumps(data, indent=2))
+        with self._lock:
+            data = {"projects": {pid: p.model_dump() for pid, p in self.projects.items()}}
+            # registry.json is the source of truth — atomic write so an interrupted save
+            # can't truncate it and brick load() on the next startup.
+            write_text_atomic(self._path, json.dumps(data, indent=2))
 
     # --- projects ---------------------------------------------------------
     def create_project(self, project_id: str, groups: list[str] | None = None) -> Project:
-        if project_id in self.projects:
-            raise KeyError(f"project {project_id!r} already exists")
-        self.projects[project_id] = Project(id=project_id, groups=groups or [])
-        self.save()
-        return self.projects[project_id]
+        with self._lock:
+            if project_id in self.projects:
+                raise KeyError(f"project {project_id!r} already exists")
+            self.projects[project_id] = Project(id=project_id, groups=groups or [])
+            self.save()
+            return self.projects[project_id]
 
     def set_project_groups(self, project_id: str, groups: list[str]) -> Project:
-        self.projects[project_id].groups = groups
-        self.save()
-        return self.projects[project_id]
+        with self._lock:
+            self.projects[project_id].groups = groups
+            self.save()
+            return self.projects[project_id]
 
     def set_project_notes(self, project_id: str, notes: str) -> Project:
-        self.projects[project_id].notes = notes
-        self.save()
-        return self.projects[project_id]
+        with self._lock:
+            self.projects[project_id].notes = notes
+            self.save()
+            return self.projects[project_id]
 
     def set_project_drive_path(self, project_id: str, drive_path: str) -> Project:
-        self.projects[project_id].drive_path = drive_path
-        self.save()
-        return self.projects[project_id]
+        with self._lock:
+            self.projects[project_id].drive_path = drive_path
+            self.save()
+            return self.projects[project_id]
 
     def delete_project(self, project_id: str) -> None:
-        self.projects.pop(project_id, None)
-        self.save()
+        with self._lock:
+            self.projects.pop(project_id, None)
+            self.save()
 
     def get_project(self, project_id: str) -> Project:
-        return self.projects[project_id]
+        # Deep-copy so a caller mutating the returned Project (outside the lock) can't
+        # edit registry state in place and re-introduce the very race the RLock prevents.
+        with self._lock:
+            return self.projects[project_id].model_copy(deep=True)
 
     def list_projects(self) -> list[Project]:
-        return list(self.projects.values())
+        with self._lock:
+            return [p.model_copy(deep=True) for p in self.projects.values()]
 
     # --- instances --------------------------------------------------------
     def add_instance(self, inst: VMInstance) -> None:
-        self.projects[inst.project_id].instances[inst.id] = inst
-        self.save()
+        with self._lock:
+            self.projects[inst.project_id].instances[inst.id] = inst
+            self.save()
 
     def remove_instance(self, instance_id: str) -> VMInstance:
-        for p in self.projects.values():
-            if instance_id in p.instances:
-                inst = p.instances.pop(instance_id)
-                self.save()
-                return inst
-        raise KeyError(f"instance {instance_id!r} not found")
+        with self._lock:
+            for p in self.projects.values():
+                if instance_id in p.instances:
+                    inst = p.instances.pop(instance_id)
+                    self.save()
+                    return inst
+            raise KeyError(f"instance {instance_id!r} not found")
 
     def get_instance(self, instance_id: str) -> VMInstance:
-        for p in self.projects.values():
-            if instance_id in p.instances:
-                return p.instances[instance_id]
-        raise KeyError(f"instance {instance_id!r} not found")
+        # Deep-copy (see get_project): the caller must not mutate registry state in place.
+        with self._lock:
+            for p in self.projects.values():
+                if instance_id in p.instances:
+                    return p.instances[instance_id].model_copy(deep=True)
+            raise KeyError(f"instance {instance_id!r} not found")
 
     def list_instances(self, project_id: str | None = None) -> list[VMInstance]:
-        if project_id is not None:
-            return list(self.projects[project_id].instances.values())
-        return [i for p in self.projects.values() for i in p.instances.values()]
+        with self._lock:
+            if project_id is not None:
+                return [
+                    i.model_copy(deep=True) for i in self.projects[project_id].instances.values()
+                ]
+            return [
+                i.model_copy(deep=True)
+                for p in self.projects.values()
+                for i in p.instances.values()
+            ]

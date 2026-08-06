@@ -1,0 +1,39 @@
+# vmctl-core — shared library; test-only (no image, no deploy). Poetry gates:
+# lock-solve + ruff + format + mypy + pytest. Consumed as a path-dep by rvmc/autopsy.
+stages:
+  - check
+  - notify
+
+check:
+  stage: check
+  image: $CI_REGISTRY/dockerhub-cache/library/python:3.14
+  before_script:
+    - pip install --no-cache-dir --quiet poetry==2.4.1
+  script:
+    - poetry check --lock          # dependency-solve gate: a stale lock fails here
+    - poetry install --no-interaction
+    - poetry run ruff check .
+    - poetry run ruff format --check .
+    - poetry run mypy vmctl_core
+    - poetry run pytest
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# On main only (post-merge, after `check` passes): tell the vmctl superproject to
+# bump its pointer to this new commit. Fires a pipeline trigger on the superproject
+# (project 1357) with the submodule path + this SHA; the superproject's auto-bump job
+# does the pointer commit. Needs SUPERPROJECT_TRIGGER_TOKEN (masked CI var).
+update-superproject:
+  stage: notify
+  image: curlimages/curl:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - >
+      curl --fail --silent --show-error --request POST
+      --form "token=${SUPERPROJECT_TRIGGER_TOKEN}"
+      --form "ref=main"
+      --form "variables[SUBMODULE]=vmctl-core"
+      --form "variables[SHA]=${CI_COMMIT_SHA}"
+      "https://git.zkm.de/api/v4/projects/1357/trigger/pipeline"

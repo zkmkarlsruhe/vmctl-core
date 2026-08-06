@@ -27,13 +27,35 @@ Stage is a marker, not a gate — going back from workbench to analysis is norma
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import date
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
 
+from .atomicio import write_text_atomic
+from .network_config import NETWORK_CONFIG_NAME, NetworkConfig
+
 STAGES = ("intake", "analysis", "workbench", "exhibition")
+
+# ArtworkDrive instances are cheap, disposable path wrappers — two callers editing the SAME
+# drive.yaml hold DIFFERENT ArtworkDrive objects, so a per-instance lock wouldn't serialise
+# them. Key the lock on the drive's resolved path so every editor of one drive shares one lock
+# and a load→mutate-one-field→save sequence (set_stage / save_network_config) can't be split
+# by a concurrent editor (which would os.replace() a snapshot missing the other's field).
+_DRIVE_LOCKS: dict[str, threading.Lock] = {}
+_DRIVE_LOCKS_GUARD = threading.Lock()
+
+
+def _drive_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _DRIVE_LOCKS_GUARD:
+        lock = _DRIVE_LOCKS.get(key)
+        if lock is None:
+            lock = _DRIVE_LOCKS[key] = threading.Lock()
+        return lock
+
 
 #: every directory a drive owns, relative to its root (order = creation order)
 SUBDIRS = (
@@ -53,6 +75,17 @@ SUBDIRS = (
 MANIFEST_NAME = "drive.yaml"
 
 
+def _confine_to_analysis(name: str) -> None:
+    """Guard: a network-config artifact name must be a bare filename living directly under
+    ``analysis/``. The pointer is trusted input from autopsy, but an absolute path or a
+    ``../`` escape (whether a bug or a poisoned manifest) would let a load/save read/overwrite
+    ``drive.yaml`` or anything outside the drive. Keep it defensively confined."""
+    if not name or name in (".", "..") or name != Path(name).name:
+        raise ValueError(
+            f"network_config name must be a bare filename under analysis/, got {name!r}"
+        )
+
+
 class ArtworkMeta(BaseModel):
     id: str
     title: str = ""
@@ -67,6 +100,7 @@ class AnalysisRef(BaseModel):
     job_id: str = ""  # == artwork id by convention
     status: str = ""  # queued | running | done | failed
     base_suggestion: str = ""  # catalog base_id, pre-fills "start VM"
+    network_config: str = ""  # filename under analysis/ of the network-config.json contract
 
 
 class HelperRef(BaseModel):
@@ -169,6 +203,11 @@ class ArtworkDrive:
         return self.path / "exhibition"
 
     @property
+    def network_config_path(self) -> Path:
+        """The canonical ``analysis/network-config.json`` path (default filename)."""
+        return self.analysis_dir / NETWORK_CONFIG_NAME
+
+    @property
     def exists(self) -> bool:
         """A drive exists once its manifest does (bare dirs are just dirs)."""
         return self.manifest_path.exists()
@@ -202,19 +241,55 @@ class ArtworkDrive:
     def save(self, manifest: DriveManifest) -> None:
         if manifest.stage not in STAGES:
             raise ValueError(f"unknown stage {manifest.stage!r} (expected one of {STAGES})")
-        self.manifest_path.write_text(
-            yaml.safe_dump(manifest.model_dump(), sort_keys=False, allow_unicode=True)
+        # drive.yaml is the source of truth shared by all three controllers — atomic write (like
+        # project.py/tools.py) so a crash/OOM/full-disk mid-write can't leave a torn manifest that
+        # fails yaml.safe_load() on the next load() and bricks the drive for every reader.
+        write_text_atomic(
+            self.manifest_path,
+            yaml.safe_dump(manifest.model_dump(), sort_keys=False, allow_unicode=True),
         )
+
+    # --- network config (analysis→revival contract) -------------------------
+    def load_network_config(self) -> NetworkConfig | None:
+        """Load the network-config.json the manifest points at, or ``None`` if
+        unset/missing. autopsy writes it; rvmc reads it (one schema, no adapter)."""
+        name = self.load().analysis.network_config
+        if not name:
+            return None
+        _confine_to_analysis(name)
+        path = self.analysis_dir / name
+        if not path.exists():
+            return None
+        return NetworkConfig.load(path)
+
+    def save_network_config(
+        self, config: NetworkConfig, *, name: str = NETWORK_CONFIG_NAME
+    ) -> None:
+        """Atomically write ``config`` under ``analysis/`` and record the pointer in
+        the manifest (``analysis.network_config``). ``analysis/`` is ensured first so
+        this works on a fresh drive."""
+        _confine_to_analysis(name)
+        self.analysis_dir.mkdir(parents=True, exist_ok=True)
+        config.save(self.analysis_dir / name)
+        # load→mutate-one-field→save under the per-drive lock: a concurrent set_stage()
+        # must not overwrite the pointer we just set (or vice-versa).
+        with _drive_lock(self.path):
+            m = self.load()
+            m.analysis.network_config = name
+            self.save(m)
 
     # --- stage --------------------------------------------------------------
     def set_stage(self, stage: str) -> DriveManifest:
         """Move the marker (not a gate — any direction is legal)."""
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r} (expected one of {STAGES})")
-        m = self.load()
-        m.stage = stage
-        self.save(m)
-        return m
+        # load→mutate-one-field→save under the per-drive lock, so a concurrent editor
+        # (save_network_config / another set_stage) can't clobber this write.
+        with _drive_lock(self.path):
+            m = self.load()
+            m.stage = stage
+            self.save(m)
+            return m
 
     # --- checksums ------------------------------------------------------------
     @staticmethod

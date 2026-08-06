@@ -12,12 +12,86 @@ import contextlib
 import ipaddress
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import zlib
 
 from .base import BackendError
+
+
+def _read_ppm_token(buf: bytes, i: int) -> tuple[bytes, int]:
+    """Read one whitespace-delimited header token from a PPM at offset ``i``,
+    skipping leading whitespace and ``#`` comment lines. Returns (token, next_i)."""
+    n = len(buf)
+    while i < n:
+        c = buf[i : i + 1]
+        if c == b"#":  # comment runs to end of line
+            while i < n and buf[i : i + 1] not in (b"\n", b"\r"):
+                i += 1
+        elif c.isspace():
+            i += 1
+        else:
+            break
+    start = i
+    while i < n and not buf[i : i + 1].isspace():
+        i += 1
+    return buf[start:i], i
+
+
+def ppm_to_png(ppm: bytes) -> bytes:
+    """Convert a binary P6 PPM (what QMP/HMP ``screendump`` writes) to PNG, using
+    only the stdlib (``zlib`` + manual chunking) so vmctl-core needs no image
+    dependency. This is the arch-portable framebuffer path: the screamer-qemu PPC
+    fork has no libpng, so ``virsh screenshot``/QMP ``screendump`` with a PNG
+    target fails there, but the default PPM dump always works — we encode the PNG
+    host-side instead of asking qemu to.
+
+    Only 8-bit RGB (maxval 255) is supported, which is the format qemu emits.
+    Raises :class:`BackendError` on any malformed / unsupported input."""
+    if not ppm.startswith(b"P6"):
+        head = ppm[:32]
+        raise BackendError(f"not a P6 PPM (screendump gave {head!r})")
+    tok_w, i = _read_ppm_token(ppm, 2)
+    tok_h, i = _read_ppm_token(ppm, i)
+    tok_max, i = _read_ppm_token(ppm, i)
+    try:
+        width, height, maxval = int(tok_w), int(tok_h), int(tok_max)
+    except ValueError as e:
+        raise BackendError(f"bad PPM header: {e}") from e
+    if maxval != 255:
+        raise BackendError(f"unsupported PPM maxval {maxval} (only 8-bit/255)")
+    # exactly one whitespace byte separates the header from the raster
+    data = ppm[i + 1 :]
+    stride = width * 3
+    expected = stride * height
+    if len(data) < expected:
+        raise BackendError(f"truncated PPM raster: {len(data)} < {expected} bytes")
+    data = data[:expected]
+
+    # PNG scanlines: each row is prefixed with a filter-type byte (0 = none).
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        raw.extend(data[y * stride : (y + 1) * stride])
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit, colour type 2 (RGB)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _chunk(b"IEND", b"")
+    )
 
 
 class LibvirtBackend:
@@ -206,11 +280,13 @@ class LibvirtBackend:
     def _has_mgmt_nic(self) -> bool:
         """True when the domain carries a NIC on the isolated MGMT_NETWORK (the
         legacy-TCP containment NIC — Hardware.mgmt_nic). Guests with one get their
-        guest_ip() resolved on the mgmt subnet only."""
-        try:
-            root = ET.fromstring(self.dumpxml())
-        except (BackendError, ET.ParseError):
-            return False
+        guest_ip() resolved on the mgmt subnet only.
+
+        Raises (does NOT return False) on a dumpxml/parse ERROR: a transient dumpxml
+        failure is not evidence of "no mgmt NIC", and swallowing it would misclassify a
+        contained dual-NIC guest as single-NIC and hand its artwork-NIC lease to the
+        control plane (containment fails OPEN). Callers catch the error and fail CLOSED."""
+        root = ET.fromstring(self.dumpxml())
         for src in root.findall("./devices/interface/source"):
             if src.get("network") == self.MGMT_NETWORK:
                 return True
@@ -231,7 +307,13 @@ class LibvirtBackend:
         # domifaddr is blind to. Resolve the lease directly from dnsmasq by MAC.
         if self._domain_arch() == "ppc":
             return self._ip_from_dnsmasq(self._domain_macs())
-        prefer_mgmt = self._has_mgmt_nic()
+        try:
+            prefer_mgmt = self._has_mgmt_nic()
+        except (BackendError, ET.ParseError):
+            # Can't read the domain's NIC topology -> fail CLOSED (return None so the
+            # caller retries) rather than defaulting to single-NIC and leaking the
+            # artwork lease to the control plane.
+            return None
         for src in ("lease", "arp", "agent"):
             p = self._virsh("domifaddr", self.name, "--source", src, check=False)
             for line in p.stdout.splitlines():
@@ -251,6 +333,66 @@ class LibvirtBackend:
                             continue
                         return ip
         return None
+
+    def _leases(self) -> list[str]:
+        """Every non-loopback IPv4 the domain has (lease/ARP/agent, dnsmasq for ppc), in
+        discovery order. The raw material control_ip()/artwork_ip() split by subnet."""
+        if self._domain_arch() == "ppc":
+            ip = self._ip_from_dnsmasq(self._domain_macs())
+            return [ip] if ip else []
+        out: list[str] = []
+        for src in ("lease", "arp", "agent"):
+            p = self._virsh("domifaddr", self.name, "--source", src, check=False)
+            for line in p.stdout.splitlines():
+                for tok in line.split():
+                    if tok.count(".") == 3 and "/" in tok:
+                        ip = tok.split("/")[0]
+                        if not ip.startswith("127.") and ip not in out:
+                            out.append(ip)
+        return out
+
+    def control_ip(self) -> str | None:
+        """The IP the CONTROL plane (agent transport: tcp_helper / raw-TCP / poll) dials.
+
+        On a dual-homed guest with an isolated control NIC (Hardware.mgmt_nic on
+        MGMT_NETWORK) this is the mgmt-subnet (10.77.0.0/24) lease; on a single-NIC guest
+        it is the sole lease. Never the artwork NIC on a control-NIC guest. Same policy as
+        the legacy guest_ip(), named for its actual role. None if the mgmt lease isn't up."""
+        leases = self._leases()
+        try:
+            has_mgmt = self._has_mgmt_nic()
+        except (BackendError, ET.ParseError):
+            # dumpxml/parse failed: can't tell single- from dual-NIC, so fail CLOSED
+            # rather than hand leases[0] (possibly the artwork NIC) to the control plane.
+            return None
+        if has_mgmt:
+            for ip in leases:
+                with contextlib.suppress(ValueError):
+                    if ipaddress.ip_address(ip) in self.MGMT_SUBNET:
+                        return ip
+            return None
+        return leases[0] if leases else None
+
+    def artwork_ip(self) -> str | None:
+        """The IP the DATA plane sees for this guest — the artwork NIC. On a control-NIC
+        guest this is the NON-mgmt lease (so source-IP->project mapping, dnsmasq and the
+        router key on the artwork interface, NOT the isolated control NIC — the codex
+        split-brain guard). On a single-NIC guest it is the sole lease. None until a
+        non-mgmt lease is visible."""
+        leases = self._leases()
+        try:
+            has_mgmt = self._has_mgmt_nic()
+        except (BackendError, ET.ParseError):
+            # dumpxml/parse failed: can't tell whether a lease is the artwork NIC or the
+            # isolated mgmt NIC, so fail CLOSED rather than risk routing the mgmt IP.
+            return None
+        if has_mgmt:
+            for ip in leases:
+                with contextlib.suppress(ValueError):
+                    if ipaddress.ip_address(ip) not in self.MGMT_SUBNET:
+                        return ip
+            return None
+        return leases[0] if leases else None
 
     def define_xml(self, xml: str) -> None:
         """Validate + redefine the persistent config from an XML string.
@@ -296,8 +438,12 @@ class LibvirtBackend:
         # undefine. x86 domains have no host-managed tap here => _ppc_tap() is None.
         tap = self._ppc_tap()
         # --snapshots-metadata so internal snapshots don't block the undefine
-        self._virsh("undefine", self.name, "--snapshots-metadata", check=False)
-        if tap:
+        p = self._virsh("undefine", self.name, "--snapshots-metadata", check=False)
+        # Tear the host tap down ONLY if the domain is actually gone. A failed undefine
+        # (domain still defined — e.g. running, or a virsh error) must keep its NIC:
+        # ripping the tap out from under a still-defined/running ppc guest kills its
+        # networking with no way back short of a re-clone.
+        if tap and p.returncode == 0:
             # local import: clone owns the tap lifecycle (create on clone, delete here)
             from ..clone import delete_ppc_tap
 
@@ -333,12 +479,46 @@ class LibvirtBackend:
 
     # --- screen -----------------------------------------------------------
     def screenshot(self, screen: int = 0) -> bytes:
-        fd, tmp = tempfile.mkstemp(suffix=".png", prefix="vmshot_")
+        """PNG bytes of a display head, captured with no guest cooperation.
+
+        Arch-portable: it does NOT use ``virsh screenshot``. That path asks qemu
+        to emit a PNG, which the screamer-qemu PPC fork (mac99 / Mac OS 9, Mac OS
+        X Tiger, Snow Leopard) cannot do — that build has no libpng, so qemu
+        answers ``Enable PNG support with libpng for screendump`` and the capture
+        fails. The agent-independent QMP backstop must work on exactly those
+        guests, so instead we drive the monitor's ``screendump`` to a temp PPM
+        (the default framebuffer dump — no libpng needed, works on every arch) and
+        encode the PNG host-side. x86 goldens take the identical path.
+
+        Returns valid PNG bytes on both x86 (win7, …) and ppc (mac9, tiger, …)
+        goldens. Raises :class:`BackendError` if the build genuinely cannot dump
+        the framebuffer (surfaced by ``qmp_backstop`` as a structured error rather
+        than a traceback)."""
+        fd, tmp = tempfile.mkstemp(suffix=".ppm", prefix="vmshot_")
         os.close(fd)
+        # Let qemu (re)create the file under its own uid/umask; a pre-existing
+        # 0600 file we own could block qemu's open() when it runs as another user.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
         try:
-            self._virsh("screenshot", self.name, tmp, "--screen", str(screen), timeout=20.0)
-            with open(tmp, "rb") as f:
-                return f.read()
+            # HMP ``screendump <file>`` with no format arg always writes a PPM of
+            # display head 0. Every golden in the fleet is single-head, so the
+            # ``screen`` arg (kept for API parity) does not select a device here.
+            p = self._virsh(
+                "qemu-monitor-command", self.name, "--hmp", f"screendump {tmp}", timeout=20.0
+            )
+            # HMP reports failures on stdout (not via exit code), e.g. an open
+            # error or a build that rejects screendump — treat a missing/short
+            # file as the failure signal and surface the monitor's message.
+            try:
+                with open(tmp, "rb") as f:
+                    ppm = f.read()
+            except OSError as e:
+                msg = (p.stdout or p.stderr or "").strip()
+                raise BackendError(
+                    f"screendump produced no output for {self.name}" + (f": {msg}" if msg else "")
+                ) from e
+            return ppm_to_png(ppm)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)

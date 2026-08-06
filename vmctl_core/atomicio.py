@@ -26,7 +26,21 @@ def write_text_atomic(path: str | Path, text: str, *, encoding: str = "utf-8") -
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp forces 0600; restore the 0644 a plain write would have produced so a drive.yaml
+        # written by one uid (the autopsy container as root) stays readable by the other controllers
+        # sharing the drive (host-side rvmc as a different user). No secrets live in these files.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, p)  # atomic on the same filesystem
+        # fsync the PARENT directory too: os.replace makes the new contents visible, but the
+        # directory entry (the rename itself) isn't durable until the dir is fsynced. Without this a
+        # hard crash right after replace can lose the rename, leaving the old file — or on some
+        # filesystems a zero-length entry. Best-effort: some platforms can't fsync a directory fd.
+        with contextlib.suppress(OSError):
+            dir_fd = os.open(str(p.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)

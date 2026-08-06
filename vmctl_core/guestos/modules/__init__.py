@@ -10,14 +10,18 @@ the proof the capability model degrades cleanly.
 
 from .linux import LinuxModule
 from .mac_os_9 import MacOS9Module
+from .mac_os_x import MacOSXModule
 from .windows_7 import Windows7Module
+from .windows_2003 import Windows2003Module
 from .windows_modern import WindowsModernModule
 from .windows_xp import WindowsXPModule
 
 __all__ = [
     "LinuxModule",
     "MacOS9Module",
+    "MacOSXModule",
     "Windows7Module",
+    "Windows2003Module",
     "WindowsModernModule",
     "WindowsXPModule",
 ]

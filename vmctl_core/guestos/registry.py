@@ -55,12 +55,22 @@ def _populate_default_registry() -> None:
     from .modules import (
         LinuxModule,
         MacOS9Module,
+        MacOSXModule,
         Windows7Module,
+        Windows2003Module,
         WindowsModernModule,
         WindowsXPModule,
     )
 
-    for cls in (WindowsXPModule, Windows7Module, WindowsModernModule, LinuxModule, MacOS9Module):
+    for cls in (
+        WindowsXPModule,
+        Windows2003Module,
+        Windows7Module,
+        WindowsModernModule,
+        LinuxModule,
+        MacOS9Module,
+        MacOSXModule,
+    ):
         default_registry.register(cls())
     default_registry.set_fallback(WindowsModernModule())
 

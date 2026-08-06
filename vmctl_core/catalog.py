@@ -17,6 +17,18 @@ from pydantic import BaseModel, Field
 _DISK_DEV = {"ide": "hda", "sata": "sda", "scsi": "sda", "virtio": "vda"}
 
 
+class AuxDisk(BaseModel):
+    """An extra boot disk attached AHEAD of the main clone — e.g. the OpenCore
+    bootloader qcow2 for a macOS golden. Like the main golden it is a read-only
+    BASE that clone.py gives a per-clone writable overlay (qemu has no readonly
+    IDE/SATA disks, and a shared writable disk would corrupt); OpenCore writes its
+    NVRAM to that overlay. Boots first, then chainloads macOS off the main disk."""
+
+    path: str  # abs path to the shared read-only base image (e.g. the OpenCore qcow2)
+    bus: str = "sata"  # ich9-AHCI (what q35 ide.N maps to; the proven Snow Leopard bus)
+    boot: int = 1  # libvirt <boot order>; lower boots earlier (OpenCore = 1)
+
+
 class Hardware(BaseModel):
     """Per-base hardware shape. Defaults suit a modern Linux guest."""
 
@@ -75,11 +87,53 @@ class Hardware(BaseModel):
     # TCP:9009; this puts that lane on an isolated NIC the untrusted artwork LAN can't
     # reach, and guest_ip() then prefers the 10.77.0.x lease so the controller/tcp_helper
     # dial the mgmt IP, not the artwork NIC. Off by default => single-NIC domains unchanged.
+    control_nic: bool = False  # ALIAS for mgmt_nic, named for the dual-pipeline role. Same
+    # emit (the isolated 10.77/24 NIC), but reads right on a VIRTIO-SERIAL golden where the
+    # NIC is not a legacy-TCP containment hack but the P3 dual-pipeline FALLBACK path:
+    # TCP-over-control-NIC that survives a vioser-driver wedge. mgmt_nic OR control_nic
+    # triggers the emit (see control_nic_enabled); existing mgmt_nic users are unaffected.
+    control_nic_model: str = ""  # model for the isolated control/mgmt NIC. '' => e1000 on a
+    # virtio-serial golden (see control_nic_model_effective), else falls back to nic_model so
+    # legacy-TCP domains stay byte-identical. e1000 is deliberate: a driver INDEPENDENT of the
+    # virtio-serial that may wedge — that independence is the whole point of the TCP fallback.
     memballoon: str = "virtio"  # 'none' for guests without the balloon driver (pristine XP)
+
+    # --- macOS-x86 (Hackintosh-style, e.g. Snow Leopard 10.6) knobs. Inert unless
+    # hw.macos is set; the template only reads them in the macos branch. macOS needs
+    # OVMF firmware, a Penryn CPU spoofing GenuineIntel, the Apple SMC device (no
+    # native libvirt element -> qemu:commandline), and an OpenCore boot disk. Pair with
+    # disk_bus='sata', nic_model='e1000', video='vmvga', virtio_serial=False,
+    # agent_channel=False, memballoon='none' (no virtio/vioser drivers on macOS -> the
+    # guest agent runs legacy-TCP on :9009 over the NAT NIC, research/64 tiger tier).
+    macos: bool = False  # select the macOS libvirt/qemu shape (OVMF + applesmc + OpenCore)
+    loader: str = ""  # OVMF firmware path emitted as <loader type='rom'> / -bios
+    smc: bool = False  # emit -device isa-applesmc,osk=... via <qemu:commandline>
+    osk: str = ""  # the 64-char Apple SMC key (the public Snow Leopard key works for 10.6)
+    cpu_features: list[str] = Field(default_factory=list)  # e.g. ['sse4.1','sse4.2','ssse3']
+    cpu_vendor: str = ""  # <cpu><vendor> — 'Intel' spoofs GenuineIntel (needed on AMD/EPYC hosts)
+    aux_disks: list[AuxDisk] = Field(default_factory=list)  # extra boot disks (OpenCore)
 
     @property
     def disk_dev(self) -> str:
         return _DISK_DEV.get(self.disk_bus, "vda")
+
+    @property
+    def control_nic_enabled(self) -> bool:
+        """Emit the isolated control/mgmt NIC? True for either flag — mgmt_nic (legacy-TCP
+        containment) or control_nic (the dual-pipeline TCP fallback role). Both render the
+        same NIC on rvmc-mgmt; the alias exists only so a vioser golden reads correctly."""
+        return self.mgmt_nic or self.control_nic
+
+    @property
+    def control_nic_model_effective(self) -> str:
+        """NIC model for the isolated control/mgmt NIC. Explicit control_nic_model wins;
+        otherwise e1000 on a virtio-serial golden — a driver INDEPENDENT of the vioser that
+        may wedge, so the TCP-over-control-NIC fallback keeps working when the primary agent
+        transport is dead (that independence is the entire point). On a legacy-TCP base (no
+        virtio-serial) it falls back to nic_model, keeping those domains byte-identical."""
+        if self.control_nic_model:
+            return self.control_nic_model
+        return "e1000" if self.virtio_serial else self.nic_model
 
     # libvirt wants these in KiB
     @property

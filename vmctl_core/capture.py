@@ -14,6 +14,8 @@ import contextlib
 import os
 import shlex
 import subprocess
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
@@ -40,6 +42,19 @@ class NetworkMonitor:
             root = Path(capture_dir)
             self._dir_for = lambda iid: root
         self._procs: dict[str, subprocess.Popen] = {}
+        # Per-instance lock so the check-then-spawn in start() (and the teardown in stop()) is
+        # atomic: two concurrent start(iid) calls from the controller's threadpool must not both
+        # pass is_capturing()==False and exec two tcpdumps onto the same <iid>.pcap (interleaved
+        # writes corrupt the capture). Different instances still capture concurrently.
+        self._start_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, iid: str) -> threading.Lock:
+        with self._locks_guard:
+            lk = self._start_locks.get(iid)
+            if lk is None:
+                lk = self._start_locks[iid] = threading.Lock()
+            return lk
 
     def _dir(self, iid: str) -> Path:
         d = Path(self._dir_for(iid))
@@ -120,6 +135,10 @@ class NetworkMonitor:
         spawner passes the helper's ``bpf_exclude`` here for mac9 instances; for
         every other guest ``exclude`` is empty and behaviour is unchanged.
         """
+        with self._lock_for(iid):
+            return self._start_locked(iid, tap, exclude)
+
+    def _start_locked(self, iid: str, tap: str, exclude: str | None) -> dict:
         if self.is_capturing(iid):
             return self.status(iid)
         pcap = self.pcap_path(iid)
@@ -127,20 +146,32 @@ class NetworkMonitor:
         bpf = ""
         safe = self._sanitize_bpf(exclude or "")
         if safe:
-            bpf = f" and not ( {safe} )"
+            # The exclude is the SOLE filter expression (tcpdump gets no base filter),
+            # so it must stand alone: `not ( <exclude> )`. A leading `and` would be a
+            # binary operator with no left operand -> libpcap `pcap_compile` syntax error
+            # -> tcpdump exits -> empty pcap (the same silent-no-capture symptom, moved
+            # from the shell to the filter compiler).
+            bpf = f"not ( {safe} )"
         # exec so the recorded pid IS tcpdump (clean kill of the root process).
-        # The capture filter goes at the END of the tcpdump command line.
-        # Shell-quote every interpolated value (paths, tap name) so a space or shell
-        # metacharacter in the capture dir / iid / tap can't corrupt the redirect or
-        # inject into the root shell. `bpf` is intentionally left un-quoted — it is a
-        # charset-validated (_sanitize_bpf) multi-token tcpdump filter that must stay
-        # word-split into separate argv entries.
+        # The capture filter is passed to tcpdump as a POSITIONAL argument ("$@"),
+        # never spliced into the `sh -c` script text. The BPF exclude contains shell
+        # control operators — the grouping parens `( )` — so interpolated raw into the
+        # script they parse as a subshell and `sh` aborts with 'Syntax error: "("
+        # unexpected'; tcpdump then never execs and every excluded guest silently
+        # captures nothing (DEVNULL hides the error). As a positional arg the shell
+        # forwards it verbatim without re-parsing, and tcpdump takes the whole word as
+        # its filter expression. Every interpolated value (paths, tap name) is
+        # shell-quoted so a space / shell metacharacter in the capture dir / iid / tap
+        # can't corrupt the redirect or inject into the root shell.
         script = (
             f"echo $$ > {shlex.quote(str(pidfile))}; "
-            f"exec tcpdump -i {shlex.quote(str(tap))} -U -s 0 -w {shlex.quote(str(pcap))}{bpf}"
+            f'exec tcpdump -i {shlex.quote(str(tap))} -U -s 0 -w {shlex.quote(str(pcap))} "$@"'
         )
+        argv = ["sudo", "-n", "sh", "-c", script, "sh"]
+        if bpf:
+            argv.append(bpf)
         proc = subprocess.Popen(
-            ["sudo", "-n", "sh", "-c", script],
+            argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -148,32 +179,99 @@ class NetworkMonitor:
         return self.status(iid)
 
     def stop(self, iid: str) -> dict:
+        with self._lock_for(iid):
+            return self._stop_locked(iid)
+
+    @staticmethod
+    def _pid_exited(proc: subprocess.Popen | None, pid: str, timeout: float) -> bool:
+        """True once the root tcpdump ``pid`` is CONFIRMED gone (not merely signalled).
+
+        With a live Popen handle a successful ``wait`` proves it — ``sudo`` outlives its
+        tcpdump child, so its exit means the child exited. On the post-restart reconcile
+        path there is no handle; a non-root ``os.kill(pid, 0)`` can't tell a ROOT process's
+        liveness (EPERM = 'alive' either way), and ``sudo kill -0`` conflates 'no such
+        process' with a sudo/exec failure. So poll ``/proc/<pid>`` instead — its existence
+        is a privilege-free, unambiguous liveness signal on Linux (the deploy platform)."""
+        if proc is not None:
+            try:
+                proc.wait(timeout=timeout)
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+        if not pid.isdigit():
+            return True  # no valid pid to track -> nothing we can keep alive
+        procfs = Path("/proc") / pid
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not procfs.exists():
+                return True  # /proc entry gone -> process exited
+            time.sleep(0.05)
+        return False
+
+    def _stop_locked(self, iid: str) -> dict:
         proc = self._procs.pop(iid, None)
         pidfile = self._pidfile(iid)
-        if pidfile.exists():
-            killed = False
-            try:
-                pid = pidfile.read_text().strip()
-                if pid:
-                    r = subprocess.run(
-                        ["sudo", "-n", "kill", pid], capture_output=True, text=True, timeout=5
+        proc_live = proc is not None and proc.poll() is None
+        # Read the recorded root pid ONCE into a local. The spawned shell writes it
+        # ("echo $$ > pidfile") a beat AFTER Popen returns, and CREATES the file before
+        # writing to it — so a start() immediately followed by stop() can see the pidfile
+        # exist but still be EMPTY. While the capture proc is live, wait for a NON-EMPTY
+        # pid so the kill path (and its timeout fallback) always target the real root pid
+        # instead of giving up and leaking the tcpdump. The fallback uses this local, not
+        # the pidfile (which we may unlink).
+        pid = ""
+        deadline = time.monotonic() + 1.0
+        while True:
+            if pidfile.exists():
+                with contextlib.suppress(OSError):
+                    pid = pidfile.read_text().strip()
+            if pid or not proc_live or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+            proc_live = proc is not None and proc.poll() is None
+
+        # `dead` gates the pidfile removal: only unlink once the root tcpdump is provably
+        # gone. While it may still be alive (kill failed / not yet exited) the pidfile
+        # stays so is_capturing() reads True and a subsequent start() won't spawn a SECOND
+        # tcpdump writing the same <iid>.pcap. An empty/absent pidfile with NO live proc =
+        # nothing to kill (is_capturing() already treats an unparseable pidfile as
+        # not-capturing); an empty pidfile WITH a live proc is the disk-anomaly case where
+        # we can't target the pid, so we do NOT declare it dead.
+        dead = not pid and not proc_live
+        if pid:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                subprocess.run(
+                    ["sudo", "-n", "kill", pid], capture_output=True, text=True, timeout=5
+                )
+            # Do NOT trust SIGTERM delivery as proof of death — CONFIRM the tcpdump is
+            # actually gone (a running process being unlinked would let an immediate
+            # start() double-write the pcap). With a Popen handle a successful wait proves
+            # it; on the reconcile path (no handle) probe the pid as root (see _pid_exited).
+            dead = self._pid_exited(proc, pid, timeout=5.0)
+            if not dead:
+                # SIGTERM didn't reap it: hard-kill the recorded root pid via sudo (proc.kill
+                # would only SIGKILL the unprivileged `sudo` wrapper, never the reparented
+                # root tcpdump), then re-confirm.
+                with contextlib.suppress(Exception):
+                    subprocess.run(
+                        ["sudo", "-n", "kill", "-9", pid],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
                     )
-                    killed = r.returncode == 0
-                else:
-                    killed = True  # empty pidfile — nothing to kill, safe to clear
-            except subprocess.TimeoutExpired:
-                killed = False
-            # Only remove the pidfile if the root tcpdump was actually killed. If the
-            # kill failed (sudoers/EPERM), keeping the pidfile means is_capturing() stays
-            # True and a subsequent start() won't spawn a SECOND tcpdump writing the same
-            # <iid>.pcap — the corruption the pidfile machinery exists to prevent.
-            if killed:
-                pidfile.unlink(missing_ok=True)
-        if proc:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                dead = self._pid_exited(proc, pid, timeout=5.0)
+            if dead and proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.kill()  # reap the sudo wrapper if it's still lingering
+        if dead:
+            pidfile.unlink(missing_ok=True)
+        elif proc is not None and proc.poll() is None:
+            # Couldn't confirm the capture stopped (kill failed, or the pid was never
+            # recorded): keep tracking the still-live proc so is_capturing() stays True
+            # (via self._procs) and a retry can target it — never drop the handle and let
+            # status() misreport a live capture as stopped, which would let start()
+            # double-spawn onto the same pcap.
+            self._procs[iid] = proc
         return self.status(iid)
 
     def status(self, iid: str) -> dict:

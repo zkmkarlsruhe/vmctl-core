@@ -14,6 +14,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from .atomicio import write_text_atomic
 from .catalog import BaseImage
 
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -55,29 +56,67 @@ def ppc_tap_name(domain_name: str) -> str:
     return f"{_TAP_PREFIX}{h}"
 
 
+#: Short bound for the `sudo ip` tap plumbing — a hung sudo (auth prompt, stuck bridge) must not
+#: block the clone forever, matching the timeouts the libvirt backend already sets on virsh.
+_TAP_TIMEOUT_S = 30
+#: Generous bound for `qemu-img create` (thin overlay is instant; a large blank disk is slower but
+#: still bounded) — an I/O-wedged qemu-img otherwise hangs the caller indefinitely.
+_QEMU_IMG_TIMEOUT_S = 300
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=_TAP_TIMEOUT_S)
+
+
+def _tap_ready(tap: str, bridge: str) -> bool:
+    """True only if `tap` EXISTS, is administratively UP, and enslaved to `bridge`.
+    A merely-present tap (down, or off the bridge) is NOT ready: the raw sungem NIC
+    would open it but the guest would never reach dnsmasq. Parses `ip -o link show`
+    for the UP flag (inside the `<...>` flag list) and the `master <bridge>` field."""
+    p = _run(["ip", "-o", "link", "show", tap])
+    if p.returncode != 0:
+        return False
+    out = p.stdout
+    flags = out.split("<", 1)[1].split(">", 1)[0] if "<" in out else ""
+    is_up = "UP" in flags.split(",")
+    enslaved = f"master {bridge}" in out
+    return is_up and enslaved
 
 
 def create_ppc_tap(tap: str, *, bridge: str = PPC_TAP_BRIDGE, user: str = PPC_TAP_USER) -> None:
     """Idempotently create a tap on `bridge`, owned by `user`, and bring it up.
-    No-op if the tap already exists. Uses passwordless `sudo ip` (works on the box).
+    No-op if the tap already exists AND is UP + enslaved. Uses passwordless `sudo ip`.
 
     The raw qemu sungem NIC opens this pre-existing tap (script=no), so it MUST
-    exist + be on the NAT bridge before the domain starts, else qemu fails to open
-    it / the guest never reaches dnsmasq. ppc-only; never called for x86 guests."""
-    # already present? (idempotent — re-clone / restart must not error)
-    if _run(["ip", "link", "show", tap]).returncode == 0:
+    exist + be UP + on the NAT bridge before the domain starts, else qemu fails to open
+    it / the guest never reaches dnsmasq. ppc-only; never called for x86 guests.
+
+    On a partial failure (add ok, but up/enslave fails) the half-created tap is torn
+    down before raising, so a retry starts clean instead of trusting a down/unbridged
+    stub — a bare `ip link show`==0 (present) is NOT proof the tap is usable."""
+    # Fully plumbed already (exists, UP, on the bridge)? idempotent no-op.
+    if _tap_ready(tap, bridge):
         return
+    # A stale/half-created tap (present but down or off the bridge, from a crashed
+    # earlier attempt) must not be trusted — remove it and recreate clean.
+    if _run(["ip", "link", "show", tap]).returncode == 0:
+        _run(["sudo", "ip", "link", "del", tap])
     p = _run(["sudo", "ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", user])
     if p.returncode != 0:
         raise CloneError(f"tap create failed for {tap}: {p.stderr.strip()}")
     up = _run(["sudo", "ip", "link", "set", tap, "up"])
     if up.returncode != 0:
+        _run(["sudo", "ip", "link", "del", tap])  # don't leave a down half-tap behind
         raise CloneError(f"tap up failed for {tap}: {up.stderr.strip()}")
     enslave = _run(["sudo", "ip", "link", "set", tap, "master", bridge])
     if enslave.returncode != 0:
+        _run(["sudo", "ip", "link", "del", tap])  # don't leave an unbridged half-tap behind
         raise CloneError(f"tap enslave to {bridge} failed for {tap}: {enslave.stderr.strip()}")
+    # Confirm the tap actually came up UP+enslaved before trusting it (guards a silent
+    # no-op success from a stubbed/odd `ip`).
+    if not _tap_ready(tap, bridge):
+        _run(["sudo", "ip", "link", "del", tap])
+        raise CloneError(f"tap {tap} not UP+enslaved to {bridge} after setup")
 
 
 def delete_ppc_tap(tap: str) -> None:
@@ -116,6 +155,7 @@ def make_overlay(base_path: Path, overlay_path: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        timeout=_QEMU_IMG_TIMEOUT_S,
     )
     if p.returncode != 0:
         raise CloneError(f"qemu-img create failed: {p.stderr.strip()}")
@@ -133,9 +173,21 @@ def make_blank_disk(disk_path: Path, size_gb: int) -> None:
         ["qemu-img", "create", "-f", "qcow2", str(disk_path), f"{int(size_gb)}G"],
         capture_output=True,
         text=True,
+        timeout=_QEMU_IMG_TIMEOUT_S,
     )
     if p.returncode != 0:
         raise CloneError(f"qemu-img create (blank) failed: {p.stderr.strip()}")
+
+
+def _resolve_catalog_path(p: str, catalog_dir: Path | None) -> str:
+    """Resolve a catalog-relative path against the catalog dir — parity with
+    BaseImage.resolved_path (main disk) and the aux_disks in clone_base, which BOTH
+    resolve relative paths this way. An absolute path or empty string passes through;
+    a None catalog_dir (bare render / preview) leaves the value untouched."""
+    if not p or catalog_dir is None:
+        return p
+    pp = Path(p)
+    return p if pp.is_absolute() else str((Path(catalog_dir) / pp).resolve())
 
 
 def resolve_emulator(base: BaseImage, default: str = DEFAULT_EMULATOR) -> str:
@@ -215,16 +267,34 @@ def render_domain_xml(
     domain_uuid: str | None = None,
     agent_sock: str = "",
     pulse_server: str = "",
+    aux_disk_paths: list[str] | None = None,
+    catalog_dir: Path | None = None,
 ) -> str:
     # A base may pin its own emulator (ppc screamer fork); it wins over the
     # deployment x86 default passed in. x86 bases leave hw.emulator unset => default.
     emulator = resolve_emulator(base, emulator)
+    # boot_iso (ppc install CD) and loader (macOS OVMF firmware) resolve relative to the
+    # catalog dir, exactly like the main disk (resolved_path) and aux_disks — a catalog
+    # that ships these as relative paths must render to absolutes qemu/libvirt can open.
+    boot_iso = _resolve_catalog_path(base.hw.boot_iso or "", catalog_dir)
+    loader = _resolve_catalog_path(base.hw.loader or "", catalog_dir)
+    # macOS aux disks (OpenCore) are read-only bases with per-clone writable overlays,
+    # like the main disk. clone_base passes the created overlay paths; a bare render (no
+    # overlays) falls back to the shared base paths so preview/tests still show the disks.
+    _aux_srcs = (
+        aux_disk_paths if aux_disk_paths is not None else [a.path for a in base.hw.aux_disks]
+    )
+    aux_disks_resolved = [
+        {"path": src, "bus": a.bus, "boot": a.boot}
+        for a, src in zip(base.hw.aux_disks, _aux_srcs, strict=True)
+    ]
     return _env.get_template("domain.xml.j2").render(
         name=name,
         uuid=domain_uuid or str(_uuid.uuid4()),
         title=title or name,
         hw=base.hw,
         disk_path=str(disk_path),
+        aux_disks_resolved=aux_disks_resolved,
         network=network,
         emulator=emulator,
         mac=mac or random_mac(),
@@ -241,6 +311,10 @@ def render_domain_xml(
         # pool could exceed that, so tell the template how many controllers to emit.
         vioser_max_ports=VIOSER_MAX_PORTS,
         pulse_server=pulse_server,
+        # Catalog-resolved (relative -> absolute) boot ISO + firmware paths; the
+        # template consumes these instead of hw.boot_iso / hw.loader directly.
+        boot_iso=boot_iso,
+        loader=loader,
     )
 
 
@@ -274,6 +348,19 @@ def clone_base(
         base_path = base.resolved_path(Path(catalog_dir))
         make_overlay(base_path, overlay_path)
 
+    # macOS aux disks (OpenCore): each is a shared read-only base that gets its own
+    # per-clone writable overlay (qemu has no readonly IDE/SATA disk; a shared writable
+    # one would corrupt). OpenCore writes its NVRAM to the overlay. Non-macOS bases have
+    # no aux_disks, so this loop is a no-op for them.
+    aux_overlays: list[str] = []
+    for i, aux in enumerate(base.hw.aux_disks):
+        aux_base = Path(aux.path)
+        if not aux_base.is_absolute():
+            aux_base = (Path(catalog_dir) / aux_base).resolve()
+        aux_overlay = Path(overlays_dir) / f"{domain_name}-aux{i}.qcow2"
+        make_overlay(aux_base, aux_overlay)
+        aux_overlays.append(str(aux_overlay))
+
     xml = render_domain_xml(
         base,
         name=domain_name,
@@ -283,8 +370,12 @@ def clone_base(
         emulator=emulator,
         agent_sock=agent_sock,
         pulse_server=pulse_server,
+        aux_disk_paths=aux_overlays,
+        catalog_dir=Path(catalog_dir),
     )
     Path(xml_dir).mkdir(parents=True, exist_ok=True)
     xml_path = Path(xml_dir) / f"{domain_name}.xml"
-    xml_path.write_text(xml)
+    # Atomic: libvirt reads this domain XML on define; a torn write (crash mid-clone) must not
+    # leave a half-written XML that define() then rejects.
+    write_text_atomic(xml_path, xml)
     return overlay_path, xml_path

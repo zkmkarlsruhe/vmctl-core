@@ -81,9 +81,9 @@
     <qemu:arg value='usb-kbd'/>
     <qemu:arg value='-drive'/>
     <qemu:arg value='file={{ disk_path }},format=qcow2,media=disk,index=0'/>
-{%- if hw.boot_iso %}
+{%- if boot_iso %}
     <qemu:arg value='-drive'/>
-    <qemu:arg value='file={{ hw.boot_iso }},format=raw,media=cdrom,index=2'/>
+    <qemu:arg value='file={{ boot_iso }},format=raw,media=cdrom,index=2'/>
 {%- endif %}
     <qemu:arg value='-audiodev'/>
 {%- if hw.audio_sink %}
@@ -93,6 +93,124 @@
     <qemu:arg value='none,id=audio1'/>
 {%- endif %}
   </qemu:commandline>
+</domain>
+{%- elif hw.macos -%}
+{# ---- macOS-x86 (Hackintosh-style: Snow Leopard 10.6 ..., Intel) ------------ #}
+{# KVM + OVMF firmware (-bios via <loader type='rom'>) + a Penryn CPU spoofing    #}
+{# GenuineIntel (the <vendor> is load-bearing only on AMD/EPYC hosts; a no-op on   #}
+{# Intel). The Apple SMC is macOS's boot gate and has NO native libvirt element,   #}
+{# so isa-applesmc,osk rides in <qemu:commandline> — the same escape-hatch the ppc #}
+{# branch uses for prom-env. Boot chain: OpenCore (a shared read-only aux disk)    #}
+{# chainloads the installed macOS on the main clone disk. Graphics via vmware-svga #}
+{# (macOS in-box driver -> real resolution); NO accelerated GL (no QE/CI), so      #}
+{# guest-side screencapture can't grab a frame -> the host screenshots via QMP.    #}
+{# USB input (macOS ignores ps2). No virtio anywhere (no macOS driver): e1000 NIC, #}
+{# no balloon, no virtio-serial -> the guest agent runs legacy-TCP on :9009 over    #}
+{# the NAT NIC (research/64 tiger tier), NOT a vioser channel. VERIFIED on 10.6.3. #}
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>{{ name }}</name>
+  <uuid>{{ uuid }}</uuid>
+  <title>{{ title }}</title>
+  <memory unit='MiB'>{{ hw.memory_mb }}</memory>
+  <currentMemory unit='MiB'>{{ hw.memory_mb }}</currentMemory>
+  <vcpu placement='static'>{{ hw.vcpus }}</vcpu>
+  <os>
+    <type arch='{{ hw.arch }}' machine='{{ hw.machine }}'>hvm</type>
+{%- if loader %}
+    {# OVMF as -bios (monolithic, non-persistent NVRAM — OpenCore's config lives on
+       its own disk, not in NVRAM, so a writable varstore is unnecessary). #}
+    <loader type='rom'>{{ loader }}</loader>
+{%- endif %}
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  {# Penryn is the newest CPU Snow Leopard's kexts know; <vendor> forces GenuineIntel
+     so macOS boots on an AMD/EPYC host too. check='none' — don't validate vs the host. #}
+  <cpu mode='custom' match='exact' check='none'>
+    <model fallback='allow'>{{ hw.cpu_model or 'Penryn' }}</model>
+{%- if hw.cpu_vendor %}
+    <vendor>{{ hw.cpu_vendor }}</vendor>
+{%- endif %}
+{%- for feat in hw.cpu_features %}
+    <feature policy='require' name='{{ feat }}'/>
+{%- endfor %}
+    {# SINGLE SOCKET — load-bearing for macOS. libvirt's default topology is one
+       socket PER vcpu (sockets=N); macOS then fails inter-socket TSC sync and hangs
+       right after OpenCore hands off to boot.efi (no kernel output) — the symptom
+       misread as an "AMD kernel wall". Collapsing every vcpu into ONE socket makes
+       Snow Leopard 10.6 boot to the desktop under KVM on an AMD/EPYC host (verified
+       2026-07-30, vmctl-lab EPYC). All cores in one socket, no SMT. #}
+    <topology sockets='1' cores='{{ hw.vcpus }}' threads='1'/>
+  </cpu>
+  <clock offset='{{ hw.clock }}'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>{{ emulator }}</emulator>
+{%- for aux in aux_disks_resolved %}
+    {# OpenCore (or other) boot disk — a PER-CLONE writable overlay on a shared read-only
+       base (clone.py creates it, like the main disk); boots first, then chainloads macOS
+       off the main clone disk. `aux.path` is the per-clone overlay (writable). #}
+    {%- set _pfx = 'hd' if aux.bus == 'ide' else ('vd' if aux.bus == 'virtio' else 'sd') %}
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{{ aux.path }}'/>
+      {# dev letters start at 'b' so an aux never collides with the main disk's 'a' slot #}
+      <target dev='{{ _pfx ~ 'bcdefgh'[loop.index0] }}' bus='{{ aux.bus }}'/>
+      <boot order='{{ aux.boot }}'/>
+    </disk>
+{%- endfor %}
+    {# main clone disk (the installed macOS golden) — boots after the OpenCore disk. #}
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{{ disk_path }}'/>
+      <target dev='{{ hw.disk_dev }}' bus='{{ hw.disk_bus }}'/>
+      <boot order='{{ (aux_disks_resolved | length) + 1 }}'/>
+    </disk>
+    <interface type='network'>
+      <mac address='{{ mac }}'/>
+      <source network='{{ network }}'/>
+      <model type='{{ hw.nic_model }}'/>
+    </interface>
+{%- if hw.usb_tablet %}
+    <input type='tablet' bus='usb'/>
+{%- endif %}
+    {# USB keyboard (macOS has no ps2 keyboard driver on this machine type). #}
+    <input type='keyboard' bus='usb'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    <video>
+{%- if hw.video in ['vga', 'cirrus', 'vmvga'] %}
+      <model type='{{ hw.video }}' vram='{{ hw.vgamem_kib }}' heads='1' primary='yes'/>
+{%- else %}
+      <model type='{{ hw.video }}' heads='1' primary='yes'/>
+{%- endif %}
+    </video>
+  </devices>
+{%- if hw.smc or hw.cpu_vendor %}
+  <qemu:commandline>
+{%- if hw.cpu_vendor %}
+    {# CPU VENDOR SPOOF — load-bearing on an AMD/EPYC host. libvirt's <cpu><vendor>
+       is dropped from the generated -cpu (it treats the model's default vendor as
+       redundant), but on AMD+KVM a bare `-cpu Penryn` leaks the host's AuthenticAMD
+       in CPUID leaf 0 and macOS refuses to boot (hangs at boot.efi, no kernel
+       output). qemu takes the LAST -cpu, so this trailing override forces the real
+       Intel vendor string + the model/features; the <cpu> element above still drives
+       the single-socket -smp topology. Verified with the topology fix on vmctl-lab
+       (EPYC) 2026-07-30 — both are required to boot Snow Leopard under KVM on AMD. #}
+    <qemu:arg value='-cpu'/>
+    <qemu:arg value='{{ hw.cpu_model or "Penryn" }},vendor=GenuineIntel{% for f in hw.cpu_features %},+{{ f }}{% endfor %}'/>
+{%- endif %}
+{%- if hw.smc %}
+    {# Apple SMC — macOS's boot gate. No native libvirt element, so inject it raw.
+       osk is the 64-char key; the public Snow Leopard key works for 10.6. #}
+    <qemu:arg value='-device'/>
+    <qemu:arg value='isa-applesmc,osk={{ hw.osk }}'/>
+{%- endif %}
+  </qemu:commandline>
+{%- endif %}
 </domain>
 {%- else -%}
 <domain type='kvm'>
@@ -168,21 +286,34 @@
       <source network='{{ network }}'/>
       <model type='{{ hw.nic_model }}'/>
     </interface>
-{%- if hw.mgmt_nic %}
-    {#- ADDITIONAL isolated host-only management NIC — containment for the legacy-TCP
-        agent transport (research/68). Guests with no virtio-serial (win2000/win98/
-        irix) run the agentbox on TCP:9009; without this that listener sits on the
-        NIC above, the same NAT network the untrusted artwork uses. This second
-        interface lives on the isolated 'rvmc-mgmt' libvirt network (no <forward>,
-        private 10.77.0.0/24 + DHCP — see deploy/networks/rvmc-mgmt.xml), so :9009 on
-        it is unreachable from the artwork/exhibition LAN. No <mac> here: libvirt
-        auto-assigns one at define time. guest_ip() prefers the 10.77.0.x lease so the
-        controller/tcp_helper dial the mgmt IP. The primary NIC above is unchanged
-        (artwork/internet path); this whole block is skipped when hw.mgmt_nic is false
-        so single-NIC domains stay byte-for-byte identical. -#}
+{%- if hw.control_nic_enabled %}
+    {#- ADDITIONAL isolated host-only CONTROL/management NIC. Two roles, one emit:
+        (a) legacy-TCP containment (research/68) — guests with NO virtio-serial
+            (win2000/win98/irix) run the agentbox on TCP:9009; without this that
+            listener would sit on the NIC above, the same NAT network the untrusted
+            artwork uses. hw.mgmt_nic selects this role.
+        (b) P3 dual-pipeline FALLBACK — a VIRTIO-SERIAL golden that ALSO sets this
+            (hw.control_nic / hw.mgmt_nic) stays dual-homed: vioser primary + this
+            control NIC carrying TCP-over-control-NIC that survives a vioser-driver
+            wedge. The artwork NIC + vioser channels + qemu-ga above are all unchanged.
+        This interface lives on the isolated 'rvmc-mgmt' libvirt network (no <forward>,
+        private 10.77.0.0/24 + DHCP — see deploy/networks/rvmc-mgmt.xml), so :9009 on it
+        is unreachable from the artwork/exhibition LAN. No <mac>: libvirt auto-assigns.
+        control_ip() prefers the 10.77.0.x lease so the controller/tcp_helper dial it.
+        MODEL — control_nic_model_effective: e1000 on a vioser golden, a driver
+        INDEPENDENT of the virtio-serial that may wedge (that independence is the whole
+        point of the fallback); nic_model on a legacy-TCP base, so those domains stay
+        byte-for-byte identical. The primary NIC above is unchanged (artwork path); this
+        whole block is skipped when neither flag is set, so single-NIC domains stay
+        byte-for-byte identical too.
+        GUEST-SIDE CAVEAT (NOT emitted here — golden-build / bootstrap workstream): the
+        guest MUST set interface metrics so this isolated control NIC (10.77/24, no
+        gateway/forward) NEVER becomes the default route (the codex NIC-ordering trap).
+        Artwork egress has to stay on the artwork NIC — otherwise the guest black-holes
+        outbound traffic at the no-forward mgmt network. -#}
     <interface type='network'>
       <source network='rvmc-mgmt'/>
-      <model type='{{ hw.nic_model }}'/>
+      <model type='{{ hw.control_nic_model_effective }}'/>
     </interface>
 {%- endif %}
     <serial type='pty'>

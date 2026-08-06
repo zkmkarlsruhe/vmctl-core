@@ -29,6 +29,13 @@ _REGISTER_DOCS: dict[str, str] = {
         "return HTML/bytes for a path or None to pass through. Reached at "
         "/plugins/<pid>/<path> (research) and the plugin's web mount (exhibition)."
     ),
+    "register_request_handler": (
+        "handler(req: PluginRequest) -> PluginResponse | None. Serve a query-param BACKEND "
+        "request (method + path + query dict + headers + body -> a content-typed PluginResponse) "
+        "— for data APIs the path-only web handler can't carry, e.g. an artwork's "
+        "xml.php?m=<mode>&q=<query> contract. Reached at /plugins/<pid>/<path>?<query>; "
+        "return None to pass through."
+    ),
     "register_state_provider": (
         "name, provider() -> dict. Expose a named blob of live state (read by the "
         "controller / AI / UI via plugin_state). Keep it cheap + JSON-serialisable."
