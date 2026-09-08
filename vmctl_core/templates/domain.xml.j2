@@ -175,6 +175,23 @@
       <source network='{{ network }}'/>
       <model type='{{ hw.nic_model }}'/>
     </interface>
+    {# EXPLICIT ICH9 EHCI + UHCI companions. Without a controller element libvirt gives q35 its
+       default, which on current libvirt is qemu-xhci (USB 3.0) — and macOS gained no xHCI driver
+       until 10.8.2, so on Snow Leopard the tablet and keyboard below hang off a bus the guest
+       cannot see: no pointer, no keys, and ps2 is no fallback because macOS has no ps2 driver
+       either. ICH9 is also what the period hardware had, and 10.6 ships AppleUSBEHCI/UHCI. The
+       UHCI companions are required, not decoration: usb-tablet and usb-kbd are full-speed USB 1.x
+       devices and cannot attach to EHCI alone. #}
+    <controller type='usb' index='0' model='ich9-ehci1'/>
+    <controller type='usb' index='0' model='ich9-uhci1'>
+      <master startport='0'/>
+    </controller>
+    <controller type='usb' index='0' model='ich9-uhci2'>
+      <master startport='2'/>
+    </controller>
+    <controller type='usb' index='0' model='ich9-uhci3'>
+      <master startport='4'/>
+    </controller>
 {%- if hw.usb_tablet %}
     <input type='tablet' bus='usb'/>
 {%- endif %}

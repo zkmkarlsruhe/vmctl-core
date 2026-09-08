@@ -115,6 +115,23 @@ class Registry:
                     return inst
             raise KeyError(f"instance {instance_id!r} not found")
 
+    def set_instance_name(self, instance_id: str, name: str | None) -> VMInstance:
+        """Set/clear an instance's friendly display name and persist it.
+
+        get_instance() hands out a deep copy, so a caller that assigns to that copy
+        and calls save() writes the *unchanged* stored instance back to disk. Name
+        changes therefore have to go through the registry, under the lock.
+        """
+        cleaned = (name or "").strip() or None
+        with self._lock:
+            for p in self.projects.values():
+                inst = p.instances.get(instance_id)
+                if inst is not None:
+                    inst.name = cleaned
+                    self.save()
+                    return inst.model_copy(deep=True)
+            raise KeyError(f"instance {instance_id!r} not found")
+
     def get_instance(self, instance_id: str) -> VMInstance:
         # Deep-copy (see get_project): the caller must not mutate registry state in place.
         with self._lock:

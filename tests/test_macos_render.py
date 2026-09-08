@@ -105,6 +105,32 @@ def test_macos_domain_shape():
     assert root.find(".//controller[@type='virtio-serial']") is None
 
 
+def test_macos_usb_is_ehci_not_xhci():
+    """Snow Leopard has no xHCI driver (Apple added USB 3.0 in 10.8.2), and no ps2 driver either —
+    so if libvirt is left to pick q35's default controller the tablet and keyboard land on a bus
+    the guest cannot see and the VM has no pointer and no keys at all. Verified live on 10.6.3.
+    """
+    root = ET.fromstring(
+        render_domain_xml(
+            _macos_base(),
+            name="sl1",
+            disk_path=Path("/clones/sl1.qcow2"),
+            mac="52:54:00:aa:bb:cc",
+        )
+    )
+    models = [c.get("model") for c in root.findall("./devices/controller[@type='usb']")]
+    assert "ich9-ehci1" in models
+    assert not any(m and "xhci" in m for m in models)
+    # usb-tablet/usb-kbd are full-speed USB 1.x — EHCI alone cannot attach them.
+    assert {"ich9-uhci1", "ich9-uhci2", "ich9-uhci3"} <= set(models)
+    startports = sorted(
+        c.find("master").get("startport")
+        for c in root.findall("./devices/controller[@type='usb']")
+        if c.find("master") is not None
+    )
+    assert startports == ["0", "2", "4"]
+
+
 def test_windows_render_unaffected_by_macos_additions():
     """A plain x86 (Windows) base must render exactly as before — SeaBIOS, no
     applesmc, no qemu namespace — proving the macOS branch is fully isolated."""
