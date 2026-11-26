@@ -1,0 +1,1091 @@
+diff --git a/scripts/src/bus.lua b/scripts/src/bus.lua
+index 82fb4146..2b749fa0 100644
+--- a/scripts/src/bus.lua
++++ b/scripts/src/bus.lua
+@@ -4078,6 +4078,8 @@ if BUSES["NSCSI"] then
+ 		MAME_DIR .. "src/devices/bus/nscsi/smoc501.h",
+ 		MAME_DIR .. "src/devices/bus/nscsi/tape.cpp",
+ 		MAME_DIR .. "src/devices/bus/nscsi/tape.h",
++		MAME_DIR .. "src/devices/bus/nscsi/vnsii.cpp",
++		MAME_DIR .. "src/devices/bus/nscsi/vnsii.h",
+ 	}
+ end
+ 
+@@ -4925,6 +4927,8 @@ if BUSES["RS232"] then
+ 		MAME_DIR .. "src/devices/bus/rs232/mboardd.h",
+ 		MAME_DIR .. "src/devices/bus/rs232/nss_tvinterface.cpp",
+ 		MAME_DIR .. "src/devices/bus/rs232/nss_tvinterface.h",
++		MAME_DIR .. "src/devices/bus/rs232/midi_bridge.cpp",
++		MAME_DIR .. "src/devices/bus/rs232/midi_bridge.h",
+ 		MAME_DIR .. "src/devices/bus/rs232/null_modem.cpp",
+ 		MAME_DIR .. "src/devices/bus/rs232/null_modem.h",
+ 		MAME_DIR .. "src/devices/bus/rs232/patchbox.cpp",
+diff --git a/src/devices/bus/nscsi/devices.cpp b/src/devices/bus/nscsi/devices.cpp
+index 30af6661..e460466b 100644
+--- a/src/devices/bus/nscsi/devices.cpp
++++ b/src/devices/bus/nscsi/devices.cpp
+@@ -20,6 +20,7 @@
+ #include "bus/nscsi/sa1403d.h"
+ #include "bus/nscsi/smoc501.h"
+ #include "bus/nscsi/tape.h"
++#include "bus/nscsi/vnsii.h"
+ 
+ void default_scsi_devices(device_slot_interface &device)
+ {
+@@ -50,4 +51,5 @@ void mac_scsi_devices(device_slot_interface &device)
+ {
+ 	default_scsi_devices(device);
+ 	device.option_replace("cdrom", NSCSI_CDROM_APPLE);
++	device.option_add("vnsii", NSCSI_VNSII);
+ }
+diff --git a/src/devices/bus/nscsi/vnsii.cpp b/src/devices/bus/nscsi/vnsii.cpp
+new file mode 100644
+index 00000000..8c007c9a
+--- /dev/null
++++ b/src/devices/bus/nscsi/vnsii.cpp
+@@ -0,0 +1,681 @@
++// license:BSD-3-Clause
++// copyright-holders:ZKM
++/*
++    VNS-II (1989-95): SCSI video analyser.
++
++    High-level emulation of the box.
++    Sources:
++    - host side: Max externals VNSII v1.09SM and pantilt v1.2 (command set, data formats)
++    - box side: EPROM M27C256B "VNS 1.07 MS" (dispatch tables at 0xa1e / 0xf90, INQUIRY blocks
++      at 0xeda / 0x1918, boot flag $71b0)
++    - box RAM block for the pan/tilt heads at 0x71d8 (firmware VNSIIstepper / HeadTracker 1.09)
++
++    Not executed: the 68332 firmware and the DSP56002 code. Motion analysis, head-tracking column
++    profile and stepper motion are re-implemented from the host-side expectations.
++
++    Command set (all 6-byte CDBs):
++    00 test unit ready, 01 reset, 02 read box RAM, 12 inquiry, 13 write box RAM,
++    0C read image / map / motion, 0D parameters, 0E field output mode, 10 write map,
++    19 vendor (0D firmware download, 0E hardware inquiry, 0F sorted motion, 10 sort depth),
++    1B start/stop (p >= 0x80 selects the boot personality)
++
++    Video input, per field: env VNSII_FRAMES1 / VNSII_FRAMES2 = file of raw 128x240 8-bit frames
++    (looped). Without a file a synthetic scene is rendered. Both are the fixed tracking camera view: the patch maps image
++    positions to absolute head steps (stepT), so the VNS-II image does not move with the heads.
++*/
++
++#include "emu.h"
++#include "vnsii.h"
++
++#include "multibyte.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#define LOG_CMD   (1U << 1)
++#define LOG_MOTOR (1U << 2)
++#define LOG_STAT  (1U << 3)
++#define VERBOSE (LOG_GENERAL | LOG_STAT)
++#include "logmacro.h"
++
++DEFINE_DEVICE_TYPE(NSCSI_VNSII, nscsi_vnsii_device, "vnsii", "VNS-II SCSI video analyser")
++
++ROM_START(vnsii)
++	ROM_REGION(0x8000, "eprom", 0)
++	ROM_LOAD("vns_1.07_ms.bin", 0x0000, 0x8000, CRC(9852ec84) SHA1(db05c05553aa8edf493bc27e15ae177d335c2c7d))
++ROM_END
++
++namespace {
++
++constexpr uint32_t INQ_APP  = 0x0eda; // application INQUIRY block: "VNSIIstepper" "1.07"
++constexpr uint32_t INQ_BOOT = 0x1918; // boot INQUIRY block: "RKBTZVII" "3.98"
++
++constexpr uint32_t PT_BASE   = 0x71d8; // pan/tilt block, unit 2 at +0x16
++constexpr uint32_t PT_SWITCH = 0x7204; // low byte: zero switches, active low
++
++constexpr double FPS = 30000.0 / 1001.0;
++
++// firmware init writes TMCR = 0x4040: TCR1 = sysclk / 4 / 4; 16 MHz oscillator on the board gives 1 us
++// shortcut: oscillator-as-sysclk inferred (env VNSII_STEP_US overrides); confirm on the DB25
++double step_unit()
++{
++	static const double unit = std::getenv("VNSII_STEP_US") ? std::atof(std::getenv("VNSII_STEP_US")) * 1e-6 : 1e-6;
++	return unit;
++}
++
++// patch stepT presets: pan 400 steps per circle, tilt 1600; robocam offsets = steps from the
++// zero switch to the centre view, which defines the switch angles of the synthetic scene. stepT gives fewer steps
++// for targets left / high in the image, so increasing steps turn the view right and down.
++constexpr double PAN_DEG_PER_STEP = 360.0 / 400.0, TILT_DEG_PER_STEP = 360.0 / 1600.0;
++constexpr double TRACKER_TILT_DEG = -20.0; // synthetic scene: elevation of the tracking camera
++// robocam pan/tilt offsets = steps from the zero switch to the centre view; they come from the host's settings.
++// Env VNSII_OFFSETS=pan1,tilt1,pan2,tilt2 sets them per installation; default 0 (heads start on the zero switch).
++int PAN_OFFSET[2] = { 0, 0 }, TILT_OFFSET[2] = { 0, 0 };
++void load_offsets()
++{
++	if (const char *o = std::getenv("VNSII_OFFSETS"))
++		std::sscanf(o, "%d,%d,%d,%d", &PAN_OFFSET[0], &TILT_OFFSET[0], &PAN_OFFSET[1], &TILT_OFFSET[1]);
++}
++constexpr double FOV_H = 57.0, FOV_V = 43.0;
++// Env VNSII_ROBOT=<prefix> writes the robotic camera view of the synthetic scene to <prefix>1.raw / 2.raw, 320x240 8-bit gray.
++// shortcut: lens estimated from video documentation (a head about a third of the image height), replace when the lens is known
++constexpr int ROBOT_W = 320, ROBOT_H = 240;
++constexpr double ROBOT_FOV_H = 20.0, ROBOT_FOV_V = 15.0;
++
++constexpr uint8_t INQ_SIG[16] = { 0x83, 0x00, 0x01, 0x01, 0x1f, 0x00, 0x00, 0x00, 'R', 'O', 'K', 'E', 'B', 'Y', 0, 0 };
++
++} // anonymous namespace
++
++nscsi_vnsii_device::nscsi_vnsii_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock) :
++	nscsi_full_device(mconfig, NSCSI_VNSII, tag, owner, clock),
++	m_eprom(*this, "eprom")
++{
++}
++
++const tiny_rom_entry *nscsi_vnsii_device::device_rom_region() const
++{
++	return ROM_NAME(vnsii);
++}
++
++void nscsi_vnsii_device::device_start()
++{
++	nscsi_full_device::device_start();
++
++	m_ram.assign(0x10000, 0);
++	load_offsets();
++	const char *ptz = std::getenv("VNSII_PTZ");
++	m_ptz = ptz ? std::fopen(ptz, "w") : nullptr;
++	if (ptz && !m_ptz)
++		logerror("cannot open %s for PTZ output\n", ptz);
++	for (int f = 0; f < 2; f++)
++	{
++		if (const char *robot = std::getenv("VNSII_ROBOT"))
++			m_field[f].robot = std::fopen((std::string(robot) + (f ? "2.raw" : "1.raw")).c_str(), "wb");
++		const char *path = std::getenv(f ? "VNSII_FRAMES2" : "VNSII_FRAMES1");
++		m_field[f].src = path ? std::fopen(path, "rb") : nullptr;
++		if (path && !m_field[f].src)
++			logerror("cannot open %s, using the synthetic scene\n", path);
++
++		save_item(m_field[f].param, "param", f);
++		save_item(m_field[f].map, "map", f);
++		save_item(m_field[f].frame, "frame", f);
++		save_item(m_field[f].prev, "prev", f);
++		save_item(m_field[f].bg, "bg", f);
++		save_item(m_field[f].motion, "motion", f);
++		save_item(m_field[f].processed, "processed", f);
++		save_item(m_field[f].frameno, "frameno", f);
++		save_item(m_field[f].last_mode, "last_mode", f);
++		for (int a = 0; a < 2; a++)
++		{
++			save_item(m_axis[f][a].phys, "phys", f * 2 + a);
++			save_item(m_axis[f][a].frac, "frac", f * 2 + a);
++			save_item(m_axis[f][a].latched, "latched", f * 2 + a);
++		}
++	}
++	save_item(NAME(m_ident));
++	save_item(NAME(m_boot));
++	save_pointer(NAME(m_ram.data()), m_ram.size());
++	save_item(NAME(m_postpro));
++	save_item(NAME(m_sort_depth));
++	save_item(NAME(m_last_motor));
++}
++
++void nscsi_vnsii_device::device_reset()
++{
++	nscsi_full_device::device_reset();
++
++	std::copy_n(&m_eprom[INQ_APP], 36, m_ident.begin());
++	m_boot = false; // EPROM 0x6c8: clr.w $71b0 at start-up
++	std::fill(m_ram.begin(), m_ram.end(), 0);
++	ram16_w(PT_SWITCH, 0x00ff);
++	m_postpro = 0;
++	m_sort_depth = 0x10;
++	m_in_kind = IN_NONE;
++	m_last_motor = machine().time();
++	for (auto &u : m_ptz_last)
++		u[0] = u[1] = INT32_MIN;
++
++	for (int f = 0; f < 2; f++)
++	{
++		// heads start at their home position (VNSII_OFFSETS; on the zero switch when unset)
++		m_axis[f][0] = { TILT_OFFSET[f], 0.0, false };
++		m_axis[f][1] = { PAN_OFFSET[f], 0.0, false };
++		ram16_w(PT_BASE + 0x16 * f + 2, 0x7fff);
++		ram16_w(PT_BASE + 0x16 * f + 10, 0x7fff);
++		ram16_w(PT_BASE + 0x16 * f + 12, 0x7fff);
++		ram16_w(PT_BASE + 0x16 * f + 20, 0x7fff);
++
++		field_t &fd = m_field[f];
++		fd.param.fill(0);
++		// host defaults (VNSII ResetVNS)
++		fd.param[0x00] = 0x100;
++		fd.param[0x02] = 3;
++		fd.param[0x03] = 0x17;
++		fd.param[0x04] = 0xf0;
++		fd.param[0x05] = 6 * 8 + 16;
++		fd.param[0x06] = 0x80;
++		fd.param[0x07] = 1;
++		fd.param[0x08] = 0x10;
++		fd.param[0x09] = 1;
++		fd.param[0x0b] = 0x100;
++		fd.map.fill(0);
++		fd.motion.fill(0);
++		fd.processed.fill(0);
++		fd.frameno = -1;
++		fd.last_mode = 0;
++		if (fd.src)
++			std::fseek(fd.src, 0, SEEK_SET);
++		render_scene(f, fd.frame.data());
++		fd.prev = fd.frame;
++		fd.bg = fd.frame;
++	}
++}
++
++//-------------------------------------------------
++//  SCSI transfer helpers
++//-------------------------------------------------
++
++void nscsi_vnsii_device::reply(const uint8_t *data, int len)
++{
++	m_out.assign(data, data + len);
++	if (len)
++		scsi_data_in(BUF_OUT, len);
++	scsi_status_complete(SS_GOOD);
++}
++
++void nscsi_vnsii_device::expect(uint8_t kind, int len)
++{
++	m_in_kind = kind;
++	m_in.assign(len, 0);
++	if (len)
++		scsi_data_out(BUF_IN, len);
++	scsi_status_complete(SS_GOOD);
++}
++
++uint8_t nscsi_vnsii_device::scsi_get_data(int id, int pos)
++{
++	if (id == BUF_OUT)
++		return pos < int(m_out.size()) ? m_out[pos] : 0;
++	return nscsi_full_device::scsi_get_data(id, pos);
++}
++
++void nscsi_vnsii_device::scsi_put_data(int id, int pos, uint8_t data)
++{
++	if (id != BUF_IN)
++		return nscsi_full_device::scsi_put_data(id, pos, data);
++	if (pos < int(m_in.size()))
++		m_in[pos] = data;
++	if (pos == int(m_in.size()) - 1)
++		finish_in();
++}
++
++void nscsi_vnsii_device::finish_in()
++{
++	switch (m_in_kind)
++	{
++	case IN_PARAMS:
++		for (size_t i = 0; i + 2 < m_in.size(); i += 3)
++		{
++			m_field[m_in_field].param[m_in[i]] = (m_in[i + 1] << 8) | m_in[i + 2];
++			LOGMASKED(LOG_CMD, "field %d param %02x = %04x\n", m_in_field, m_in[i], m_field[m_in_field].param[m_in[i]]);
++		}
++		break;
++	case IN_MAP:
++		std::copy_n(m_in.begin(), std::min<size_t>(FRAME, m_in.size()), m_field[m_in_field].map.begin());
++		break;
++	case IN_FIRMWARE:
++		install_firmware();
++		break;
++	case IN_POKE:
++		motors_update();
++		for (size_t i = 0; i < m_in.size(); i++)
++			m_ram[(m_in_addr + i) & 0xffff] = m_in[i];
++		break;
++	}
++	m_in_kind = IN_NONE;
++}
++
++void nscsi_vnsii_device::install_firmware()
++{
++	// The image carries its own INQUIRY block; VNSIIstepper 1.09 and HeadTracker 1.09 both report "1.07"
++	auto it = std::search(m_in.begin(), m_in.end(), std::begin(INQ_SIG), std::end(INQ_SIG));
++	if (it != m_in.end() && m_in.end() - it >= 36)
++		std::copy_n(it, 36, m_ident.begin());
++	uint32_t sum = 0;
++	for (uint8_t b : m_in)
++		sum = sum * 31 + b;
++	logerror("firmware download %d bytes (hash %08x), product \"%.16s\" rev \"%.4s\"\n",
++			int(m_in.size()), sum, (const char *)&m_ident[16], (const char *)&m_ident[32]);
++	m_boot = false;
++}
++
++//-------------------------------------------------
++//  command dispatch
++//-------------------------------------------------
++
++void nscsi_vnsii_device::scsi_command()
++{
++	const uint8_t *c = m_scsi_cmdbuf;
++	const uint16_t count = (c[2] << 8) | c[3];
++	LOGMASKED(LOG_CMD, "cmd %02x %02x %02x %02x %02x %02x\n", c[0], c[1], c[2], c[3], c[4], c[5]);
++
++	switch (c[0])
++	{
++	case 0x00: // test unit ready
++	case 0x01: // reset
++		scsi_status_complete(SS_GOOD);
++		break;
++
++	case 0x02: // read box RAM: 02 A23..16 A15..8 A7..0 N
++	{
++		motors_update();
++		const uint32_t addr = (c[1] << 16) | (c[2] << 8) | c[3];
++		const int n = c[4] ? c[4] : 0x100;
++		std::vector<uint8_t> d(n);
++		for (int i = 0; i < n; i++)
++			d[i] = m_ram[(addr + i) & 0xffff];
++		reply(d.data(), n);
++		break;
++	}
++
++	case 0x13: // write box RAM
++		m_in_addr = (c[1] << 16) | (c[2] << 8) | c[3];
++		expect(IN_POKE, c[4] ? c[4] : 0x100);
++		break;
++
++	case 0x12: // inquiry
++		reply(m_boot ? &m_eprom[INQ_BOOT] : m_ident.data(), std::min<int>(c[4], 36));
++		break;
++
++	case 0x0c: // read buffer: byte 1 bit 3 = field, low bits 0 raw motion, 1 image, 2 map, 7 processed motion
++	{
++		const int f = (c[1] >> 3) & 1;
++		field_update(f);
++		field_t &fd = m_field[f];
++		switch (c[1] & 7)
++		{
++		case 1:
++		{
++			std::array<uint8_t, FRAME> img = fd.frame;
++			if (img[0] == 0xff) // 0xff in byte 0 means "No Video Signal!" to the host
++				img[0] = 0xfe;
++			reply(img.data(), std::min<int>(count, FRAME));
++			break;
++		}
++		case 2:
++			reply(fd.map.data(), std::min<int>(count, FRAME));
++			break;
++		case 0:
++		case 7:
++		{
++			const auto &src = (c[1] & 7) ? fd.processed : fd.motion;
++			const int n = std::min<int>(count, 256);
++			std::vector<uint8_t> d(n * 4);
++			for (int i = 0; i < n; i++)
++				put_u32be(&d[i * 4], src[i]);
++			reply(d.data(), n * 4);
++			break;
++		}
++		default:
++			scsi_unknown_command();
++		}
++		break;
++	}
++
++	case 0x0d: // parameters: 0D F 00 00 3k, k records [code][hi][lo]
++		m_in_field = c[1] & 1;
++		expect(IN_PARAMS, c[4]);
++		break;
++
++	case 0x0e: // field output mode
++		m_postpro = c[4];
++		scsi_status_complete(SS_GOOD);
++		break;
++
++	case 0x10: // write map
++		m_in_field = (c[1] >> 3) & 1;
++		expect(IN_MAP, count);
++		break;
++
++	case 0x19: // vendor, byte 4 = sub-command
++		switch (c[4])
++		{
++		case 0x0d: // firmware download, n x 512
++			expect(IN_FIRMWARE, count * 512);
++			break;
++		case 0x0e: // hardware inquiry (EPROM vector 0x3f8 -> same block as INQUIRY)
++			reply(m_ident.data(), std::min<int>(c[3], 36));
++			break;
++		case 0x0f: // sorted motion: n longs (values) then n words (cell indices)
++		{
++			const int f = c[1] & 1;
++			field_update(f);
++			const field_t &fd = m_field[f];
++			const int ncells = std::clamp<int>(fd.param[0x09], 1, 256);
++			const int n = std::clamp<int>(count, 1, 32);
++			std::vector<int> idx(ncells);
++			for (int i = 0; i < ncells; i++)
++				idx[i] = i;
++			std::stable_sort(idx.begin(), idx.end(), [&fd](int a, int b) { return fd.processed[a] > fd.processed[b]; });
++			std::vector<uint8_t> d(n * 6, 0);
++			for (int i = 0; i < n && i < ncells; i++)
++			{
++				put_u32be(&d[i * 4], fd.processed[idx[i]]);
++				put_u16be(&d[n * 4 + i * 2], idx[i]);
++			}
++			reply(d.data(), n * 6);
++			break;
++		}
++		case 0x10: // sort depth
++			m_sort_depth = count;
++			scsi_status_complete(SS_GOOD);
++			break;
++		default: // 00..0C: debugger/monitor interface, no caller in the host externals
++			scsi_status_complete(SS_GOOD);
++			break;
++		}
++		break;
++
++	case 0x1b: // start/stop; EPROM 0xeaa: p >= 0x80 sets the personality flag $71b0 = p & 0x7f
++		if (c[4] >= 0x80)
++			m_boot = (c[4] & 0x7f) != 0;
++		scsi_status_complete(SS_GOOD);
++		break;
++
++	default:
++		nscsi_full_device::scsi_command();
++		break;
++	}
++}
++
++//-------------------------------------------------
++//  pan/tilt heads (TPU stepper channels behind the RAM block)
++//-------------------------------------------------
++
++void nscsi_vnsii_device::motors_update()
++{
++	const attotime now = machine().time();
++	const double dt = (now - m_last_motor).as_double();
++	m_last_motor = now;
++
++	uint8_t sw = m_ram[PT_SWITCH + 1] | 0x0f;
++	for (int u = 0; u < 2; u++)
++	{
++		const uint32_t b = PT_BASE + 0x16 * u;
++		const bool enabled = ram16(b) != 0;
++		for (int a = 0; a < 2; a++)
++		{
++			const uint32_t o = b + 2 + a * 10; // desired, base, accel, ctl, current
++			axis_t &ax = m_axis[u][a];
++			uint16_t des = ram16(o);
++			uint16_t cur = ram16(o + 8);
++
++			if (enabled && des != cur && dt > 0)
++			{
++				// shortcut: constant speed at the minimum step time, no acceleration ramp; add the ramp when the step unit is measured
++				const int steps = std::max(1, ram16(o + 6) >> 8);
++				const int32_t accel = ram16(o + 4);
++				const int32_t maxt = int32_t(ram16(o + 2)) - 2 * accel;
++				const int32_t mint = std::max<int32_t>(250, maxt - accel * (steps - 1));
++				ax.frac += dt / (mint * step_unit());
++				int32_t n = int32_t(ax.frac);
++				ax.frac -= n;
++				const int32_t dist = int32_t(des) - int32_t(cur);
++				n = std::min<int32_t>(n, std::abs(dist));
++				if (dist < 0)
++				{
++					n = std::min(n, ax.phys); // mechanical end stop at the switch
++					cur -= n;
++					ax.phys -= n;
++				}
++				else
++				{
++					cur += n;
++					ax.phys += n;
++				}
++			}
++			else
++				ax.frac = 0;
++
++			// firmware zero-switch logic: on the closing edge current = desired = 0x7fff, then refuse desired < 0x7fff
++			const bool closed = ax.phys <= 0;
++			if (closed)
++			{
++				if (!ax.latched)
++				{
++					cur = des = 0x7fff;
++					ax.latched = true;
++					LOGMASKED(LOG_MOTOR, "unit %d %s at zero switch\n", u + 1, a ? "pan" : "tilt");
++				}
++				if (des < 0x7fff)
++					des = 0x7fff;
++				sw &= ~(1 << (u * 2 + a));
++			}
++			else
++				ax.latched = false;
++
++			ram16_w(o, des);
++			ram16_w(o + 8, cur);
++		}
++	}
++	m_ram[PT_SWITCH + 1] = sw;
++
++	if (m_ptz)
++		for (int u = 0; u < 2; u++)
++			if (m_axis[u][0].phys != m_ptz_last[u][0] || m_axis[u][1].phys != m_ptz_last[u][1])
++			{
++				m_ptz_last[u][0] = m_axis[u][0].phys;
++				m_ptz_last[u][1] = m_axis[u][1].phys;
++				// angles relative to the centre view: pan right positive, tilt up positive
++				std::fprintf(m_ptz, "%d %.3f %.3f %d\n", u + 1,
++						(m_axis[u][1].phys - PAN_OFFSET[u]) * PAN_DEG_PER_STEP,
++						-(m_axis[u][0].phys - TILT_OFFSET[u]) * TILT_DEG_PER_STEP,
++						ram16(PT_BASE + 0x16 * u) != 0);
++				std::fflush(m_ptz);
++			}
++}
++
++//-------------------------------------------------
++//  video and analysis
++//-------------------------------------------------
++
++void nscsi_vnsii_device::render_scene(int f, uint8_t *dst)
++{
++	field_t &fd = m_field[f];
++	motors_update();
++	if (fd.src)
++	{
++		std::array<uint8_t, FRAME> raw;
++		bool ok = std::fread(raw.data(), 1, FRAME, fd.src) == size_t(FRAME);
++		if (!ok)
++		{
++			std::fseek(fd.src, 0, SEEK_SET);
++			ok = std::fread(raw.data(), 1, FRAME, fd.src) == size_t(FRAME);
++		}
++		if (ok)
++		{
++			std::copy(raw.begin(), raw.end(), dst);
++			return;
++		}
++	}
++
++	draw_scene(f, dst, W, H, 0.0, TRACKER_TILT_DEG, FOV_H, FOV_V);
++}
++
++// synthetic: eight visitors walking around the bunker, seen from above. Tracking camera: fixed view; robotic camera: follows the head
++void nscsi_vnsii_device::draw_scene(int f, uint8_t *dst, int w, int h, double pan, double tilt, double fov_h, double fov_v)
++{
++	const double t = machine().time().as_double();
++	// head elevation per visitor: far visitors high in the view, near ones (below the camera pole) low
++	struct fig { double centre, amp, w, ph, half, head; };
++	static const fig figs[8] = {
++		{    0.0, 35.0, 0.21, 0.0, 3.0,  -6.0 }, {   10.0, 25.0, 0.13, 2.0, 2.6, -12.0 },
++		{  -20.0, 40.0, 0.07, 4.0, 3.4, -20.0 }, {  120.0, 30.0, 0.11, 1.0, 2.8, -30.0 },
++		{ -120.0, 30.0, 0.17, 3.0, 3.2, -36.0 }, {  180.0, 45.0, 0.05, 5.0, 3.0, -26.0 },
++		{ -140.0, 25.0, 0.09, 2.5, 3.6, -40.0 }, {   60.0, 40.0, 0.15, 1.5, 3.0, -16.0 } };
++
++	for (int r = 0; r < h; r++)
++	{
++		const double el = tilt + (h / 2 - r) * fov_v / h;
++		for (int col = 0; col < w; col++)
++		{
++			const double az = pan + (col - w / 2) * fov_h / w;
++			int v = 56 + int(6.0 * std::sin(az * M_PI / 40.0) + 0.3 * el);
++			if ((int(std::floor(az / 4.0)) + int(std::floor(el / 4.0))) & 1) // wall pattern, makes the robotic camera's move visible
++				v += 8;
++			for (int i = 0; i < 8; i++)
++			{
++				const fig &g = figs[i];
++				const double cx = g.centre + g.amp * std::sin(g.w * t + g.ph + f);
++				const double dx = std::remainder(az - cx, 360.0);
++				const bool body = std::fabs(dx) < g.half && el < g.head - 2.5 && el > g.head - 45.0;
++				const bool head = dx * dx + (el - g.head) * (el - g.head) < 2.4 * 2.4;
++				if (body || head)
++					v = 175 + i * 9;
++			}
++			dst[r * w + col] = uint8_t(v);
++		}
++	}
++}
++
++void nscsi_vnsii_device::field_update(int f)
++{
++	field_t &fd = m_field[f];
++	const int64_t now = int64_t(machine().time().as_double() * FPS);
++	if (now == fd.frameno)
++		return;
++	fd.frameno = now;
++	fd.prev = fd.frame;
++	render_scene(f, fd.frame.data());
++	analyse(f);
++	// Env VNSII_ALIVE=<file>: touched about once a second. This code only runs when the host reads the box, so the file
++	// proves that the patch is polling, not just that the emulator process exists
++	if (const char *alive = std::getenv("VNSII_ALIVE"); alive && (now % 30) == 0)
++		if (FILE *a = std::fopen(alive, "w"))
++			std::fclose(a);
++	if (fd.robot && !fd.src)
++	{
++		// one frame per video frame since the last write, so the file keeps emulated time
++		std::vector<uint8_t> view(ROBOT_W * ROBOT_H);
++		draw_scene(f, view.data(), ROBOT_W, ROBOT_H, (m_axis[f][1].phys - PAN_OFFSET[f]) * PAN_DEG_PER_STEP,
++				TRACKER_TILT_DEG - (m_axis[f][0].phys - TILT_OFFSET[f]) * TILT_DEG_PER_STEP, ROBOT_FOV_H, ROBOT_FOV_V);
++		for (; fd.robot_frames <= now; fd.robot_frames++)
++			std::fwrite(view.data(), 1, view.size(), fd.robot);
++		std::fflush(fd.robot);
++	}
++}
++
++void nscsi_vnsii_device::analyse(int f)
++{
++	field_t &fd = m_field[f];
++	const uint16_t mode = fd.param[0x01];
++	const bool light = mode & 0x20, presence = mode & 0x40;
++	// entering presence mode re-learns the background (patch: clearshadows, emptycheck switch motion -> presence)
++	if (presence && !(fd.last_mode & 0x40)) // last_mode: mode word of the previous analysed frame
++		fd.bg = fd.frame;
++	fd.last_mode = mode;
++	const int noise = fd.param[0x02];
++	const int64_t sens = fd.param[0x00];
++
++	std::array<uint8_t, FRAME> d;
++	for (int i = 0; i < FRAME; i++)
++	{
++		int v = light ? fd.frame[i] : std::abs(int(fd.frame[i]) - int(presence ? fd.bg[i] : fd.prev[i]));
++		d[i] = (!light && v <= noise) ? 0 : uint8_t(v);
++	}
++
++	if ((mode & 7) == 6)
++	{
++		// head tracking: [0..127] summed difference per column (HeadHistories needs > intensity threshold, default
++		// 256, at the peak column), [128..255] top moving row + vertical delay;
++		// the host (HeadTrackingSmear) subtracts the vertical delay, smears across columns and takes 0xf0 - y as
++		// silhouette height (HeadSeeker), so a column without motion reports the bottom row 240
++		for (int col = 0; col < W; col++)
++		{
++			int64_t sum = 0;
++			int top = -1;
++			for (int r = 0; r < H; r++)
++				if (d[r * W + col])
++				{
++					sum += d[r * W + col];
++					if (top < 0)
++						top = r;
++				}
++			fd.motion[col] = int32_t((sum * sens) >> 8);
++			fd.motion[W + col] = (top < 0 ? H : top) + fd.param[0x03];
++		}
++	}
++	else
++	{
++		std::array<int64_t, 256> acc{};
++		for (int i = 0; i < FRAME; i++)
++			acc[fd.map[i]] += d[i];
++		const int64_t scale = fd.param[0x0c] ? fd.param[0x0b] : 0x100;
++		for (int i = 0; i < 256; i++)
++			fd.motion[i] = int32_t(((acc[i] * sens) >> 8) * scale >> 8);
++	}
++
++	if ((fd.frameno % 30) == 0)
++	{
++		int cols = 0;
++		for (int col = 0; col < W; col++)
++			cols += fd.motion[col] != 0;
++		const uint32_t pb = PT_BASE + 0x16 * f;
++		LOGMASKED(LOG_STAT, "field %d mode %02x: %d active columns, pan %d tilt %d (phys); en %04x tilt des %04x cur %04x base %04x acc %04x ctl %04x; pan des %04x cur %04x base %04x acc %04x ctl %04x\n",
++				f, mode, cols, m_axis[f][1].phys, m_axis[f][0].phys, ram16(pb),
++				ram16(pb + 2), ram16(pb + 10), ram16(pb + 4), ram16(pb + 6), ram16(pb + 8),
++				ram16(pb + 12), ram16(pb + 20), ram16(pb + 14), ram16(pb + 16), ram16(pb + 18));
++	}
++
++	if (const char *dump = std::getenv("VNSII_DUMP"))
++		if (FILE *df = std::fopen(dump, "ab"))
++		{
++			int32_t hdr[2] = { f, mode };
++			std::fwrite(hdr, sizeof(hdr), 1, df);
++			std::fwrite(fd.motion.data(), 4, 256, df);
++			std::fclose(df);
++		}
++
++	// shortcut: filter as first-order smoothing over param 0x0A frames; replace with the DSP rule if it is ever decoded
++	const int k = fd.param[0x0a];
++	for (int i = 0; i < 256; i++)
++		fd.processed[i] = int32_t((int64_t(fd.processed[i]) * k + fd.motion[i]) / (k + 1));
++
++	// background: param 0x07 is an enable pulse from the patch's p adapter (1 for one tick every A+1 ticks).
++	// shortcut: each enabled frame moves the background 1/adaptrate (param 0x08) toward the frame; DSP rule unknown
++	if (fd.param[0x07])
++	{
++		const int rate = std::max<int>(1, fd.param[0x08]);
++		for (int i = 0; i < FRAME; i++)
++		{
++			const int b = fd.bg[i], v = fd.frame[i];
++			int step = (v - b) / rate;
++			if (!step && v != b)
++				step = v > b ? 1 : -1;
++			fd.bg[i] = uint8_t(b + step);
++		}
++	}
++}
+diff --git a/src/devices/bus/nscsi/vnsii.h b/src/devices/bus/nscsi/vnsii.h
+new file mode 100644
+index 00000000..e4096777
+--- /dev/null
++++ b/src/devices/bus/nscsi/vnsii.h
+@@ -0,0 +1,95 @@
++// license:BSD-3-Clause
++// copyright-holders:ZKM
++#ifndef MAME_BUS_NSCSI_VNSII_H
++#define MAME_BUS_NSCSI_VNSII_H
++
++#pragma once
++
++#include "machine/nscsi_bus.h"
++#include "machine/nscsi_hle.h"
++
++#include <array>
++#include <cstdio>
++#include <vector>
++
++// VNS-II (1989-95), video analyser on SCSI.
++// High-level model of the box:
++// command set taken from the host externals VNSII / pantilt and the box EPROM "VNS 1.07 MS".
++// The CPU32/TPU and DSP56002 code is not executed; the analysis is re-implemented.
++class nscsi_vnsii_device : public nscsi_full_device
++{
++public:
++	nscsi_vnsii_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
++
++	static constexpr int W = 128;       // analysis columns
++	static constexpr int H = 240;       // analysis rows (one NTSC field)
++	static constexpr int FRAME = W * H; // 0x7800 bytes, image and map transfer size
++
++protected:
++	virtual void device_start() override ATTR_COLD;
++	virtual void device_reset() override ATTR_COLD;
++	virtual const tiny_rom_entry *device_rom_region() const override ATTR_COLD;
++
++	virtual void scsi_command() override;
++	virtual uint8_t scsi_get_data(int id, int pos) override;
++	virtual void scsi_put_data(int id, int pos, uint8_t data) override;
++
++private:
++	enum { BUF_OUT = 2, BUF_IN = 3 };
++
++	enum : uint8_t { IN_NONE, IN_PARAMS, IN_MAP, IN_FIRMWARE, IN_POKE };
++
++	struct axis_t {
++		int32_t phys;      // steps above the zero switch (physical head angle)
++		double  frac;      // fractional step accumulator
++		bool    latched;   // zero-switch edge already handled
++	};
++
++	struct field_t {
++		std::array<uint16_t, 256> param;
++		std::array<uint8_t, FRAME> map;
++		std::array<uint8_t, FRAME> frame;
++		std::array<uint8_t, FRAME> prev;
++		std::array<uint8_t, FRAME> bg;
++		std::array<int32_t, 256> motion;     // raw values for getMotion
++		std::array<int32_t, 256> processed;  // filtered values for getProcessedMotion
++		int64_t frameno;
++		int last_mode;
++		FILE *src;
++		FILE *robot = nullptr;
++		int64_t robot_frames = 0;
++	};
++
++	required_region_ptr<uint8_t> m_eprom;
++
++	std::array<uint8_t, 36> m_ident;      // INQUIRY data of the running firmware
++	bool m_boot;                          // boot personality ("RKBTZVII"), EPROM $71b0
++	std::vector<uint8_t> m_ram;           // box RAM as seen by readSCSIBytes / writeSCSIBytes
++	std::vector<uint8_t> m_out, m_in;
++	uint8_t m_in_kind;
++	uint32_t m_in_addr, m_in_field;
++	uint16_t m_postpro, m_sort_depth;
++	field_t m_field[2];
++	axis_t m_axis[2][2];                  // [unit][0 = tilt, 1 = pan]
++	attotime m_last_motor;
++	FILE *m_ptz;                          // env VNSII_PTZ: head angles out, one line per change
++	int32_t m_ptz_last[2][2];
++
++	void reply(const uint8_t *data, int len);
++	void expect(uint8_t kind, int len);
++	void finish_in();
++	void install_firmware();
++
++	uint16_t ram16(uint32_t a) const { return (m_ram[a & 0xffff] << 8) | m_ram[(a + 1) & 0xffff]; }
++	void ram16_w(uint32_t a, uint16_t v) { m_ram[a & 0xffff] = v >> 8; m_ram[(a + 1) & 0xffff] = v; }
++	void motors_update();
++
++	void field_update(int f);
++	void render_scene(int f, uint8_t *dst);
++	void draw_scene(int f, uint8_t *dst, int w, int h, double pan, double tilt, double fov_h, double fov_v);
++	void analyse(int f);
++};
++
++DECLARE_DEVICE_TYPE(NSCSI_VNSII, nscsi_vnsii_device)
++
++#endif // MAME_BUS_NSCSI_VNSII_H
+diff --git a/src/devices/bus/rs232/midi_bridge.cpp b/src/devices/bus/rs232/midi_bridge.cpp
+new file mode 100644
+index 00000000..5fa6dc0d
+--- /dev/null
++++ b/src/devices/bus/rs232/midi_bridge.cpp
+@@ -0,0 +1,76 @@
++// license:BSD-3-Clause
++// copyright-holders:ZKM
++#include "emu.h"
++#include "midi_bridge.h"
++
++DEFINE_DEVICE_TYPE(MIDI_BRIDGE, midi_bridge_device, "midi_bridge", "Serial MIDI interface bridge")
++
++midi_bridge_device::midi_bridge_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock) :
++	device_t(mconfig, MIDI_BRIDGE, tag, owner, clock),
++	device_serial_interface(mconfig, *this),
++	device_rs232_port_interface(mconfig, *this),
++	m_stream(*this, "stream"),
++	m_input_count(0),
++	m_input_index(0),
++	m_timer_poll(nullptr)
++{
++}
++
++void midi_bridge_device::device_add_mconfig(machine_config &config)
++{
++	BITBANGER(config, m_stream);
++}
++
++void midi_bridge_device::device_start()
++{
++	m_timer_poll = timer_alloc(FUNC(midi_bridge_device::update_queue), this);
++	save_item(NAME(m_input_buffer));
++	save_item(NAME(m_input_count));
++	save_item(NAME(m_input_index));
++}
++
++void midi_bridge_device::device_reset()
++{
++	set_data_frame(1, 8, PARITY_NONE, STOP_BITS_1);
++	set_rate(31250);
++	output_rxd(1);
++	output_dcd(0);
++	output_dsr(0);
++	output_cts(0);
++	m_input_count = m_input_index = 0;
++	update_queue(0);
++}
++
++TIMER_CALLBACK_MEMBER(midi_bridge_device::update_queue)
++{
++	if (!is_transmit_register_empty())
++		return;
++	if (m_input_index == m_input_count)
++	{
++		m_input_index = 0;
++		m_input_count = m_stream->input(m_input_buffer, sizeof(m_input_buffer));
++	}
++	if (m_input_index != m_input_count)
++	{
++		transmit_register_setup(m_input_buffer[m_input_index++]);
++		m_timer_poll->adjust(attotime::never);
++		return;
++	}
++	m_timer_poll->adjust(attotime::from_hz(3125)); // poll once per MIDI byte time
++}
++
++void midi_bridge_device::tra_callback()
++{
++	output_rxd(transmit_register_get_data_bit());
++}
++
++void midi_bridge_device::tra_complete()
++{
++	update_queue(0);
++}
++
++void midi_bridge_device::rcv_complete()
++{
++	receive_register_extract();
++	m_stream->output(get_received_char());
++}
+diff --git a/src/devices/bus/rs232/midi_bridge.h b/src/devices/bus/rs232/midi_bridge.h
+new file mode 100644
+index 00000000..652d23c1
+--- /dev/null
++++ b/src/devices/bus/rs232/midi_bridge.h
+@@ -0,0 +1,44 @@
++// license:BSD-3-Clause
++// copyright-holders:ZKM
++#ifndef MAME_BUS_RS232_MIDI_BRIDGE_H
++#define MAME_BUS_RS232_MIDI_BRIDGE_H
++
++#pragma once
++
++#include "rs232.h"
++#include "imagedev/bitbngr.h"
++#include "diserial.h"
++
++// Serial MIDI interface on a Mac modem/printer port: 31250 Bd 8N1, raw MIDI bytes to and from a bitbanger
++// stream (e.g. -bitb socket.127.0.0.1:5001). The 1 MHz interface clock on HSKi/TRxC is set in the machine driver.
++class midi_bridge_device : public device_t,
++	public device_serial_interface,
++	public device_rs232_port_interface
++{
++public:
++	midi_bridge_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
++
++	virtual void input_txd(int state) override { device_serial_interface::rx_w(state); }
++
++protected:
++	virtual void device_start() override ATTR_COLD;
++	virtual void device_reset() override ATTR_COLD;
++	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
++
++	virtual void tra_callback() override;
++	virtual void tra_complete() override;
++	virtual void rcv_complete() override;
++
++private:
++	TIMER_CALLBACK_MEMBER(update_queue);
++
++	required_device<bitbanger_device> m_stream;
++	uint8_t m_input_buffer[256];
++	uint32_t m_input_count;
++	uint32_t m_input_index;
++	emu_timer *m_timer_poll;
++};
++
++DECLARE_DEVICE_TYPE(MIDI_BRIDGE, midi_bridge_device)
++
++#endif // MAME_BUS_RS232_MIDI_BRIDGE_H
+diff --git a/src/devices/bus/rs232/rs232.cpp b/src/devices/bus/rs232/rs232.cpp
+index a06f0e54..27826d99 100644
+--- a/src/devices/bus/rs232/rs232.cpp
++++ b/src/devices/bus/rs232/rs232.cpp
+@@ -162,6 +162,7 @@ device_rs232_port_interface::~device_rs232_port_interface()
+ #include "loopback.h"
+ #include "mboardd.h"
+ #include "nss_tvinterface.h"
++#include "midi_bridge.h"
+ #include "null_modem.h"
+ #include "patchbox.h"
+ #include "printer.h"
+@@ -189,6 +190,7 @@ void default_rs232_devices(device_slot_interface &device)
+ 	device.option_add("msystems_mouse",MSYSTEMS_HLE_SERIAL_MOUSE);
+ 	device.option_add("nss_tvi",       NSS_TVINTERFACE);
+ 	device.option_add("null_modem",    NULL_MODEM);
++	device.option_add("midi_bridge",   MIDI_BRIDGE);
+ 	device.option_add("patch",         RS232_PATCH_BOX);
+ 	device.option_add("printer",       SERIAL_PRINTER);
+ 	device.option_add("pty",           PSEUDO_TERMINAL);
+diff --git a/src/devices/machine/z80scc.cpp b/src/devices/machine/z80scc.cpp
+index 99cdc17a..7f7fac98 100644
+--- a/src/devices/machine/z80scc.cpp
++++ b/src/devices/machine/z80scc.cpp
+@@ -2096,7 +2096,7 @@ void z80scc_channel::do_sccreg_wr11(uint8_t data)
+ 	switch (data & WR11_RCVCLK_SRC_MASK)
+ 	{
+ 	case WR11_RCVCLK_SRC_RTXC: LOG("Receive clock source is RTxC\n"); break;
+-	case WR11_RCVCLK_SRC_TRXC: LOG("Receive clock source is TRxC - not implemented\n"); break;
++	case WR11_RCVCLK_SRC_TRXC: LOG("Receive clock source is TRxC\n"); break;
+ 	case WR11_RCVCLK_SRC_BR:   LOG("Receive clock source is Baudrate Generator\n"); break;
+ 	case WR11_RCVCLK_SRC_DPLL: LOG("Receive clock source is DPLL - not implemented\n"); break;
+ 	}
+@@ -2812,6 +2812,16 @@ unsigned int z80scc_channel::get_rtxc_rate()
+ 	return rate;
+ }
+ 
++// get_trxc_rate - TRxC pin as clock input (fixed rate from configure_channels txa/txb)
++//-------------------------------------------------
++unsigned int z80scc_channel::get_trxc_rate()
++{
++	unsigned int source = (m_index == z80scc_device::CHANNEL_A) ? m_uart->m_txca : m_uart->m_txcb;
++	unsigned int rate = source / get_clock_mode();
++	LOG("   - TRxC Source bit rate (%d) = TRxC (%d) / (%d)\n", rate, source, get_clock_mode());
++	return rate;
++}
++
+ void z80scc_channel::update_baudtimer()
+ {
+ 	unsigned int rate;
+@@ -2897,6 +2907,10 @@ void z80scc_channel::update_serial()
+ 			LOG("- Receiver clock source RTxC is edge-driven externally\n");
+ 		}
+ 		break;
++	case WR11_RCVCLK_SRC_TRXC:
++		set_rcv_rate(get_trxc_rate());
++		LOG("- Receiver clock source TRxC (rate %d, clock %d)\n", get_trxc_rate(), get_clock_mode());
++		break;
+ 	case WR11_RCVCLK_SRC_BR:
+ 		set_rcv_rate(m_brg_rate);
+ 		LOG("- Receiver clock source BRG (rate %d, clock %d)\n", m_brg_rate, get_clock_mode());
+@@ -2922,6 +2936,10 @@ void z80scc_channel::update_serial()
+ 			LOGTX("   - Transmit clock source RTxC is edge-driven externally\n");
+ 		}
+ 		break;
++	case WR11_TRACLK_SRC_TRXC:
++		set_tra_rate(get_trxc_rate());
++		LOGTX("   - Transmit clock source TRxC: %d mode: %dx\n", get_trxc_rate(), get_clock_mode());
++		break;
+ 	case WR11_TRACLK_SRC_BR:
+ 		if (is_transmit_register_empty())
+ 		{
+@@ -2989,7 +3007,8 @@ void z80scc_channel::write_rx(int state)
+ 
+ 	LOGRCV("%s(%d)\n", FUNCNAME, state);
+ 	m_rxd = state;
+-	if (edge_driven_rxc || m_rxc != 0 || m_brg_rate != 0)
++	bool trxc_rxc = (m_wr11 & WR11_RCVCLK_SRC_MASK) == WR11_RCVCLK_SRC_TRXC && get_trxc_rate() != 0;
++	if (edge_driven_rxc || trxc_rxc || m_rxc != 0 || m_brg_rate != 0)
+ 		device_serial_interface::rx_w(state);
+ }
+ 
+diff --git a/src/devices/machine/z80scc.h b/src/devices/machine/z80scc.h
+index ede9a090..e2cb0a9b 100644
+--- a/src/devices/machine/z80scc.h
++++ b/src/devices/machine/z80scc.h
+@@ -234,6 +234,7 @@ protected:
+ 
+ 	unsigned int get_brg_rate();
+ 	unsigned int get_rtxc_rate();
++	unsigned int get_trxc_rate();
+ 	void update_baudtimer();
+ 
+ 	void scc_register_write(uint8_t reg, uint8_t data);
+diff --git a/src/frontend/mame/ui/ui.cpp b/src/frontend/mame/ui/ui.cpp
+index fd59bb3d..8d52a9a6 100644
+--- a/src/frontend/mame/ui/ui.cpp
++++ b/src/frontend/mame/ui/ui.cpp
+@@ -49,6 +49,7 @@
+ #include "../osd/modules/lib/osdlib.h"
+ #include "../osd/modules/lib/osdobj_common.h"
+ 
++#include <cstdlib>
+ #include <functional>
+ #include <type_traits>
+ 
+@@ -664,6 +665,10 @@ void mame_ui_manager::display_startup_screens(bool first_time)
+ 	if (!first_time || (str > 0 && str < 60*5) || &machine().system() == &GAME_NAME(___empty) || (machine().debug_flags & DEBUG_FLAG_ENABLED) || video_none)
+ 		show_gameinfo = show_warnings = false;
+ 
++	// unattended installation: nobody is there to press a key
++	if (std::getenv("MAME_NO_STARTUP_SCREENS"))
++		show_gameinfo = show_warnings = false;
++
+ #if defined(__EMSCRIPTEN__)
+ 	// also disable for the JavaScript port since the startup screens do not run asynchronously
+ 	show_gameinfo = show_warnings = false;
+diff --git a/src/mame/apple/macquadra605.cpp b/src/mame/apple/macquadra605.cpp
+index 541ab6f2..338b0766 100644
+--- a/src/mame/apple/macquadra605.cpp
++++ b/src/mame/apple/macquadra605.cpp
+@@ -169,7 +169,8 @@ void quadra605_state::macqd605(machine_config &config)
+ 	m_primetime->set_scsi_tag(m_ncr1);
+ 
+ 	SCC85C30(config, m_scc, C7M);
+-	m_scc->configure_channels(3'686'400, 3'686'400, 3'686'400, 3'686'400);
++	// TRxC (HSKi) carries 1 MHz from a MIDI interface; x32 clock mode gives 31250 Bd
++	m_scc->configure_channels(3'686'400, 1'000'000, 3'686'400, 1'000'000);
+ 	m_scc->out_int_callback().set(m_primetime, FUNC(primetime_device::scc_irq_w));
+ 	m_scc->out_txda_callback().set("modem", FUNC(rs232_port_device::write_txd));
+ 	m_scc->out_txdb_callback().set("printer", FUNC(rs232_port_device::write_txd));

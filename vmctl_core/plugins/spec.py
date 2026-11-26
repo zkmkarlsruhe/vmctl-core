@@ -13,7 +13,9 @@ the research workbench runs unchanged in the exhibition runtime.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pathlib import PurePosixPath
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class PluginTarget(BaseModel):
@@ -61,6 +63,19 @@ class PluginManifest(BaseModel):
     # Explicit, additive claim list (see PluginClaim). Empty + backend_host set => one default
     # HTTP(S) claim on that host (back-compat). Use effective_claims() to get the resolved set.
     claims: list[PluginClaim] = Field(default_factory=list)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def _entrypoint_stays_inside(cls, v: str) -> str:
+        """The entrypoint is joined to the plugin directory and exec'd. A manifest is data —
+        it arrives inside an imported bundle or a project's plugin dir — so an ``../``or an
+        absolute path would have the loader execute a file outside the plugin. Whoever writes
+        the manifest can already write the plugin next to it, so this is containment, not a
+        privilege boundary: it keeps "which file runs" answerable from the plugin dir alone."""
+        p = PurePosixPath(v)
+        if p.is_absolute() or ".." in p.parts or not v.strip():
+            raise ValueError(f"entrypoint must stay inside the plugin dir, got {v!r}")
+        return v
 
     def effective_claims(self) -> list[PluginClaim]:
         """The resolved claim set: explicit ``claims`` if given, else the ``backend_host``

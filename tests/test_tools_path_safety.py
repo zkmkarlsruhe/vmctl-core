@@ -12,7 +12,8 @@ import threading
 
 import pytest
 
-from vmctl_core.tools import Tool, ToolsLibrary, _confined_path, _safe_segment
+from vmctl_core.paths import safe_segment
+from vmctl_core.tools import Tool, ToolsLibrary, _confined_path
 
 
 def _mk_lib(tmp_path):
@@ -45,7 +46,7 @@ def test_load_rejects_poisoned_escaping_path(tmp_path):
                         "os": "winxp",
                         "runtime": "flash",
                         "version": "1",
-                        "path": "../../../../home/scharc/.ssh/id_ed25519",
+                        "path": "../../../../home/user/.ssh/id_ed25519",
                     }
                 ]
             }
@@ -90,8 +91,8 @@ def test_abs_path_confines(tmp_path):
 def test_safe_segment_rejects_separators_and_dotdot():
     for bad in ("../../etc", "a/b", "..", ".", "", "foo/bar"):
         with pytest.raises(ValueError):
-            _safe_segment(bad, field="os")
-    assert _safe_segment("winxp", field="os") == "winxp"
+            safe_segment(bad, field="os")
+    assert safe_segment("winxp", field="os") == "winxp"
 
 
 @pytest.mark.parametrize("field", ["os", "runtime", "version"])
@@ -153,7 +154,6 @@ def test_read_during_write_does_not_raise(tmp_path):
         try:
             while not stop.is_set():
                 lib.list()
-                lib.reads(mime="application/x-shockwave-flash")
         except Exception as e:  # pragma: no cover - only on a regression
             errors.append(e)
 

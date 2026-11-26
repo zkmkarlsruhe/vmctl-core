@@ -24,11 +24,13 @@ of ``plugin/`` differs.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -63,7 +65,7 @@ def iter_bundle_files(bundle_dir: str | Path):
     root = Path(bundle_dir)
     manifest = Path(CHECKSUMS)
     for p in sorted(root.rglob("*")):
-        if p.is_file():
+        if p.is_file() and not p.is_symlink():  # a symlink's target is not bundle payload
             rel = p.relative_to(root)
             if rel != manifest:
                 yield rel
@@ -77,6 +79,79 @@ def write_checksums(bundle_dir: str | Path) -> Path:
     # Atomic — a truncated CHECKSUMS.sha256 makes the whole bundle unverifiable.
     write_text_atomic(out, "\n".join(lines) + "\n")
     return out
+
+
+#: A sealed bundle's files are read-only and its directories are read+execute but not writable —
+#: so nothing can be added, removed or overwritten inside it without first taking the seal off.
+_SEALED_FILE_MODE = 0o444
+_SEALED_DIR_MODE = 0o555
+_UNSEALED_FILE_MODE = 0o644
+_UNSEALED_DIR_MODE = 0o755
+
+
+def _chmod_tree(bundle_dir: str | Path, *, file_mode: int, dir_mode: int) -> int:
+    """chmod every file and directory in the tree (the root last, so its own entries stay editable
+    while we walk it). Returns the number of paths changed. Best-effort per path: a bundle can sit
+    on a filesystem that does not carry unix modes (a FAT stick a colleague hands you), and there
+    the chmod is a silent no-op rather than a failure."""
+    root = Path(bundle_dir)
+    changed = 0
+    for p in sorted(root.rglob("*"), reverse=True):
+        if p.is_symlink():
+            continue  # chmod follows the link: never touch a target outside the tree
+        with contextlib.suppress(OSError):
+            p.chmod(dir_mode if p.is_dir() else file_mode)
+            changed += 1
+    with contextlib.suppress(OSError):
+        root.chmod(dir_mode)
+        changed += 1
+    return changed
+
+
+def seal_bundle(bundle_dir: str | Path) -> int:
+    """Make a finished bundle read-only. Call it AFTER :func:`write_checksums`.
+
+    A promoted bundle is the artefact an exhibition machine will import, possibly years later, and
+    CHECKSUMS.sha256 is what tells that machine the bundle is intact. It is a good detector and a
+    poor preventer: by the time it fires, whatever wrote into the bundle wrote a long time ago, and
+    the promotion that produced it may no longer be reproducible. Sealing closes the ordinary ways
+    a bundle rots in place — a half-finished re-promote, a plugin writing next to its own files, a
+    hand-edit "just to fix one path" — by making them fail at the moment they happen, loudly, in
+    front of whoever is doing it.
+
+    It is a guardrail, not a boundary. The seal is unix modes on files the promoting user owns, so
+    that user (and root) can take it off — deliberately, which is the point. A boundary against a
+    process that WANTS to write here is a different mechanism: separate ownership, or a read-only
+    mount for whatever runs artwork code. Nothing in this system currently hands an artwork process
+    a writable path into the exhibition tree, and that is the property worth keeping true."""
+    return _chmod_tree(bundle_dir, file_mode=_SEALED_FILE_MODE, dir_mode=_SEALED_DIR_MODE)
+
+
+def unseal_bundle(bundle_dir: str | Path) -> int:
+    """Give write permission back — needed before overwriting or deleting a sealed bundle.
+
+    ``shutil.rmtree`` cannot remove entries from a 0555 directory, so every caller that supersedes
+    or cleans up a promoted bundle has to come through here first."""
+    return _chmod_tree(bundle_dir, file_mode=_UNSEALED_FILE_MODE, dir_mode=_UNSEALED_DIR_MODE)
+
+
+def remove_sealed_tree(path: str | Path) -> None:
+    """``shutil.rmtree`` that copes with sealed bundles inside ``path``.
+
+    Deleting a project drive means deleting whatever promoted bundles it holds, and those are
+    read-only (:func:`seal_bundle`). Plain rmtree cannot remove an entry from a 0555 directory, so
+    a purge over a drive with a promoted bundle half-succeeds and leaves the rest standing, with
+    only a warning in the log to say so.
+
+    Implemented as chmod-the-tree-then-delete rather than rmtree's error hook, because the hook
+    parameter that does this correctly (``onexc``) is 3.12+ and this package still supports 3.11 —
+    the exhibition controller installs onto whatever interpreter the gallery machine has. Walking
+    the tree twice costs nothing next to deleting a multi-GB bundle.
+    """
+    target = Path(path)
+    if target.is_dir():
+        _chmod_tree(target, file_mode=_UNSEALED_FILE_MODE, dir_mode=_UNSEALED_DIR_MODE)
+    shutil.rmtree(target)
 
 
 def verify_bundle(bundle_dir: str | Path) -> dict:
@@ -107,6 +182,10 @@ def verify_bundle(bundle_dir: str | Path) -> dict:
             digest, _, rel = line.partition("  ")
             recorded[rel.strip()] = digest.strip()
     present = {rel.as_posix() for rel in iter_bundle_files(root)}
+    # Symlinks are never hashed, packed or sealed; a bundle carrying one is not self-contained.
+    out["unsafe"] = sorted(
+        p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_symlink()
+    )
 
     root_res = root.resolve()
     for rel, digest in recorded.items():
@@ -132,8 +211,85 @@ def verify_bundle(bundle_dir: str | Path) -> dict:
         and out["format"] == BUNDLE_FORMAT
     )
     if out["unsafe"]:
-        out["error"] = "bundle references paths outside the bundle root"
+        out["error"] = "bundle references paths outside the bundle root (or holds symlinks)"
     return out
+
+
+def create_process_bundle(
+    instance_dir: str | Path,
+    bundle_dir: str | Path,
+    *,
+    provenance: dict,
+) -> Path:
+    """Seal a stopped process instance for exhibition, without disk conversion.
+
+    vm/process.json and its relative images/media form a complete instance. The
+    exhibition controller supplies a real display; host media is copied, never linked.
+    Executable media is recorded so zip transport can restore its executable bits.
+    """
+    from .backends.process import SPEC_FILE, ProcessBackend, process_path
+
+    instance = Path(instance_dir)
+    backend = ProcessBackend(instance.name, instance_dir=instance)
+    if backend.is_running():
+        raise ValueError("stop the process instance before promotion")
+    spec = backend.spec.model_copy(deep=True)
+    if spec.cwd and spec.cwd != ".":
+        process_path(instance, spec.cwd)
+    if spec.alive_file:
+        process_path(instance, spec.alive_file)
+    if set(spec.images) & spec.media.keys():
+        raise ValueError("process images and media overlap")
+    root = Path(bundle_dir)
+    root.mkdir(parents=True)  # a failed export must never replace an existing bundle
+    try:
+        vm = root / "vm"
+        vm.mkdir()
+        executables = []
+        for name in [*spec.images, *spec.media]:
+            source = process_path(instance, name)
+            target = process_path(vm, name)
+            if name in spec.images and not source.resolve().is_relative_to(instance.resolve()):
+                raise ValueError(f"process image outside instance: {name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if name in spec.media:
+                want = spec.media_sha256.get(name, "")
+                if not want or sha256_file(target) != want.lower():
+                    raise ValueError(f"process media sha256 mismatch: {name}")
+                if source.stat().st_mode & 0o111:
+                    executables.append(f"vm/{name}")
+        if spec.cwd:
+            (vm / spec.cwd).mkdir(parents=True, exist_ok=True)
+        spec.virtual_display = False
+        spec.display = ":0"
+        spec.vnc_port = 0
+        spec.env.pop("DISPLAY", None)
+        spec.media = {name: name for name in spec.media}
+        write_text_atomic(vm / SPEC_FILE, spec.model_dump_json(indent=2))
+        write_yaml(
+            root / BUNDLE_YAML,
+            {
+                "bundle_format": BUNDLE_FORMAT,
+                "vm": {
+                    "backend": "process",
+                    "profile": "process",
+                    "artifact": {"kind": "process", "path": f"vm/{SPEC_FILE}"},
+                    "images": [f"vm/{name}" for name in spec.images],
+                    "media": [f"vm/{name}" for name in spec.media],
+                    "executables": executables,
+                },
+            },
+        )
+        write_yaml(root / PROVENANCE, provenance)
+        write_checksums(root)
+        seal_bundle(root)
+        for name in executables:
+            bundle_path(root, name).chmod(0o555)
+    except BaseException:
+        remove_sealed_tree(root)
+        raise
+    return root
 
 
 # --- single-file transport (research/29 §8 handoff) ---------------------------
@@ -157,13 +313,15 @@ def _resolve_thin_base(bundle_dir: Path, catalog_path: str | Path) -> tuple[Path
 
     ref = read_yaml(bundle_dir / "vm" / "base.ref.yaml")
     want = ref.get("sha256") or ""
+    if not want:
+        raise ValueError("thin bundle is missing golden base sha256 in vm/base.ref.yaml")
     fields = {k: v for k, v in ref.items() if k != "sha256"}
     base = BaseImage(**fields)
     p = base.resolved_path(Path(catalog_path).parent)
     if not p.is_file():
         raise FileNotFoundError(f"golden base not found for thin bundle: {p}")
     got = sha256_file(p)
-    if want and got != want:
+    if got != want:
         raise ValueError(f"golden base sha256 mismatch (bundle wants {want}, catalog has {got})")
     return p, got
 
@@ -173,33 +331,82 @@ def _bake_one(overlay: Path, base: Path, out_disk: Path, qemu_img: str) -> str:
     with tempfile.TemporaryDirectory(prefix="vmctl-bake-") as td:
         tmp_overlay = Path(td) / "overlay.qcow2"
         shutil.copy2(overlay, tmp_overlay)
+        # copy2 preserves the source mode, and a promoted bundle is SEALED read-only — so the
+        # copy lands at 0444 and `qemu-img rebase` fails on it. Baking from a sealed bundle is
+        # the normal case (the catalog serves zips straight off the drive rvmc promoted into),
+        # so make our own scratch copy writable. The source stays untouched, sealed.
+        tmp_overlay.chmod(0o644)
         # -u (unsafe): just rewrite the backing pointer to the resolved base; the
-        # base is byte-identical to what the overlay was authored on, so no check
-        # is needed. Then convert reads base+delta and emits one flat image.
-        subprocess.run(
-            [qemu_img, "rebase", "-u", "-b", str(base), "-F", "qcow2", str(tmp_overlay)],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [qemu_img, "convert", "-O", "qcow2", str(tmp_overlay), str(out_disk)],
-            check=True,
-            capture_output=True,
-        )
+        # caller verified a thin base's recorded sha256 before reaching this step.
+        # Then convert reads base+delta and emits one flat image.
+        try:
+            subprocess.run(
+                [qemu_img, "rebase", "-u", "-b", str(base), "-F", "qcow2", str(tmp_overlay)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [qemu_img, "convert", "-O", "qcow2", str(tmp_overlay), str(out_disk)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    qemu_img,
+                    "compare",
+                    "-f",
+                    "qcow2",
+                    "-F",
+                    "qcow2",
+                    str(tmp_overlay),
+                    str(out_disk),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            # the real reason (missing backing file, ENOSPC) is in stderr, not the exit code
+            raise RuntimeError(
+                f"{' '.join(e.cmd[:2])} failed: "
+                f"{(e.stderr or e.stdout or b'').decode(errors='replace').strip()}"
+            ) from e
     return sha256_file(out_disk)
 
 
 def _main_base(root: Path, catalog_path: str | Path | None) -> Path:
     """The golden for a bundle's MAIN disk — embedded (fat) or resolved from the catalog."""
     embedded = root / "vm" / "base.qcow2"
-    if embedded.is_file():
+    vm = read_yaml(root / BUNDLE_YAML).get("vm") or {}
+    if embedded.is_file() and vm.get("profile") != "thin":
         return embedded
     if catalog_path:
         return _resolve_thin_base(root, catalog_path)[0]
     raise ValueError("thin bundle needs catalog_path to resolve the golden base for baking")
 
 
-def _aux_source_disks(root: Path) -> list[dict]:
+#: Free space the unpack refuses to eat into. The exhibition host's root filesystem carries the
+#: running exhibit's disk; filling it stops the artwork, not just the import.
+_UNPACK_HEADROOM_BYTES = 1 << 30  # 1 GiB
+
+
+def bundle_path(root: Path, rel: str) -> Path:
+    """Resolve a bundle-declared relative path, refusing anything outside the bundle.
+
+    Every path a bundle names for itself goes through here. ``verify()`` already guarded the
+    CHECKSUMS entries this way, but the paths bundle.yaml declares for its own disks did not:
+    ``vm.artifact.path`` and each ``vm.aux_disks[].overlay`` were joined to the root and used
+    straight away. CHECKSUMS is not a signature — the submitter writes it — so a bundle could
+    declare ``path: ../../<other-project>/vm/overlay.qcow2``, pass verification, and have bake
+    flatten ANOTHER project's disk into the image the submitter then downloads.
+    """
+    relp = Path(rel)
+    root_res = root.resolve()
+    if relp.is_absolute() or not (root_res / relp).resolve().is_relative_to(root_res):
+        raise ValueError(f"bundle declares a path outside itself: {rel!r}")
+    return root / relp
+
+
+def _aux_source_disks(root: Path, base_roots: Sequence[Path] = ()) -> list[dict]:
     """Aux boot disks (e.g. OpenCore for macOS) a thin bundle declares in ``vm.aux_disks``.
 
     Each entry: ``{overlay: vm/aux-N.qcow2, base_path: <abs shared base>, base_sha, bus, boot}``.
@@ -209,18 +416,34 @@ def _aux_source_disks(root: Path) -> list[dict]:
     vm = (read_yaml(root / BUNDLE_YAML).get("vm")) or {}
     out = []
     for a in vm.get("aux_disks") or []:
-        overlay = root / a["overlay"]
+        overlay = bundle_path(root, a["overlay"])
         if not overlay.is_file():
             raise FileNotFoundError(f"aux overlay not in bundle: {overlay}")
+        # base_path is an ABSOLUTE host path by design (a shared read-only base, not a catalog
+        # id), so bundle_path() cannot confine it — and CHECKSUMS proves nothing here either,
+        # since whoever writes the bundle writes the checksums. Unconfined, a crafted bundle
+        # could name any readable file and have bake flatten it into the disk the submitter then
+        # downloads. The producer always writes <catalog dir>/<aux.path>, so the catalog's own
+        # directory is the honest boundary; the caller passes it.
         base = Path(a["base_path"])
+        if not base_roots:
+            raise ValueError(
+                f"refusing to resolve aux base {base} — no allowed base roots were given "
+                f"(pass base_roots, or catalog_path so it can be derived)"
+            )
+        resolved = base.resolve()
+        if not any(resolved.is_relative_to(r) for r in base_roots):
+            raise ValueError(
+                f"aux base {base} is outside the allowed base roots "
+                f"({', '.join(str(r) for r in base_roots)})"
+            )
         if not base.is_file():
             raise FileNotFoundError(f"aux base not found: {base}")
-        if a.get("base_sha"):
-            got = sha256_file(base)
-            if got != a["base_sha"]:
-                raise ValueError(
-                    f"aux base sha256 mismatch ({base}): want {a['base_sha']}, got {got}"
-                )
+        if not a.get("base_sha"):
+            raise ValueError(f"thin bundle is missing aux base sha256 (base_sha): {base}")
+        got = sha256_file(base)
+        if got != a["base_sha"]:
+            raise ValueError(f"aux base sha256 mismatch ({base}): want {a['base_sha']}, got {got}")
         out.append(
             {
                 "overlay": overlay,
@@ -249,8 +472,10 @@ def bake_disk(
     """
     root = Path(bundle_dir)
     vm = (read_yaml(root / BUNDLE_YAML).get("vm")) or {}
+    if vm.get("backend") == "process":
+        raise ValueError("process bundles contain raw images and do not need baking")
     overlay_rel = (vm.get("artifact") or {}).get("path") or "vm/overlay.qcow2"
-    overlay = root / overlay_rel
+    overlay = bundle_path(root, overlay_rel)
     if not overlay.is_file():
         raise FileNotFoundError(f"bundle has no overlay to bake: {overlay}")
     return _bake_one(overlay, _main_base(root, catalog_path), Path(out_disk), qemu_img)
@@ -261,13 +486,15 @@ def pack_bundle_zip(
     out_zip: str | Path,
     *,
     catalog_path: str | Path | None = None,
+    base_roots: Sequence[str | Path] | None = None,
     qemu_img: str = "qemu-img",
 ) -> dict:
     """Pack a promotion bundle into ONE self-contained BAKED zip for an exhibition host.
 
     A bundle with a ``vm/`` section is baked: its overlay chain is flattened into a
     single standalone ``vm/disk.qcow2`` (the golden + base-ref are dropped), and the
-    manifest is rewritten as a ``baked`` bundle. An already-baked bundle
+    manifest is rewritten as a ``baked`` bundle. Process bundles carry raw images
+    and media verbatim; no baking or catalog is needed. An already-baked bundle
     (``vm/disk.qcow2`` present) is repackaged verbatim; a plugin-only bundle (no
     ``vm/`` section) likewise. Returns ``{zip, bundle, profile, baked, disk_sha256,
     files}``. The source bundle directory is left untouched.
@@ -278,8 +505,16 @@ def pack_bundle_zip(
     by = read_yaml(root / BUNDLE_YAML)
     vm = by.get("vm") or {}
     already_baked = str(vm.get("profile", "")).startswith("baked")
-    to_bake = bool(vm) and not already_baked
-    aux_src = _aux_source_disks(root) if to_bake else []
+    is_process = vm.get("backend") == "process"
+    if is_process and not verify_bundle(root)["ok"]:
+        raise ValueError("process bundle failed checksum verification")
+    to_bake = bool(vm) and not already_baked and not is_process
+    # Where an aux base may live. Defaults to the catalog's own directory, which is where the
+    # producer puts it; an explicit list wins for a caller with a different layout.
+    roots = [Path(r).resolve() for r in (base_roots or [])]
+    if not roots and catalog_path:
+        roots = [Path(catalog_path).resolve().parent]
+    aux_src = _aux_source_disks(root, roots) if to_bake else []
 
     # The golden base, every CoW overlay (main + aux) and the base-ref never travel
     # in a baked package — the flattened standalone disks replace them.
@@ -334,7 +569,9 @@ def pack_bundle_zip(
                     }
                 )
                 idx += 1
-            main_overlay = root / ((vm.get("artifact") or {}).get("path") or "vm/overlay.qcow2")
+            main_overlay = bundle_path(
+                root, (vm.get("artifact") or {}).get("path") or "vm/overlay.qcow2"
+            )
             out = Path(tmpdir.name) / f"disk-{idx}.qcow2"
             sha = _bake_one(main_overlay, _main_base(root, catalog_path), out, qemu_img)
             disk_shas.append(sha)
@@ -416,6 +653,20 @@ def unpack_bundle_zip(zip_path: str | Path, dest_dir: str | Path) -> Path:
     dest_res = dest.resolve()
     tops: set[str] = set()
     with zipfile.ZipFile(zip_path) as z:
+        # Refuse a bundle that cannot fit BEFORE writing any of it. Bundles are legitimately
+        # multi-GB, so the bound is the disk itself rather than a fixed cap: the exhibition
+        # importer unpacks into a temp dir on the same filesystem as the running exhibit's
+        # qcow2, so a 5 MB zip declaring a 500 GB member would ENOSPC the artwork that is
+        # currently on the wall. The declared sizes are attacker-controlled, but a lie in
+        # either direction is caught — too small and the extract itself hits ENOSPC, too
+        # large and we refuse a bundle that would not have fit anyway.
+        declared = sum(max(i.file_size, 0) for i in z.infolist())
+        free = shutil.disk_usage(dest).free
+        if declared > free - _UNPACK_HEADROOM_BYTES:
+            raise ValueError(
+                f"bundle expands to {declared} bytes; only {free} free at {dest} "
+                f"(keeping {_UNPACK_HEADROOM_BYTES} headroom)"
+            )
         for info in z.infolist():
             name = info.filename
             if not (dest / name).resolve().is_relative_to(dest_res):
@@ -426,4 +677,17 @@ def unpack_bundle_zip(zip_path: str | Path, dest_dir: str | Path) -> Path:
             z.extract(info, dest)
     if len(tops) != 1:
         raise ValueError(f"zip must contain exactly one bundle dir, found: {sorted(tops)}")
-    return dest / tops.pop()
+    root = dest / tops.pop()
+    vm = (read_yaml(root / BUNDLE_YAML).get("vm") or {}) if (root / BUNDLE_YAML).is_file() else {}
+    if vm.get("backend") == "process":
+        if not verify_bundle(root)["ok"]:
+            raise ValueError("unpacked process bundle failed checksum verification")
+        from .backends.process import ProcessSpec, process_path
+
+        definition = bundle_path(root, vm["artifact"]["path"])
+        spec = ProcessSpec.model_validate_json(definition.read_text())
+        if spec.cwd and spec.cwd != ".":
+            process_path(definition.parent, spec.cwd).mkdir(parents=True, exist_ok=True)
+        for name in vm.get("executables", []):
+            bundle_path(root, name).chmod(0o755)
+    return root

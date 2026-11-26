@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+Date: Thu, 22 Feb 2024 14:31:36 +0000
+Subject: [PATCH 11/16] WIP: remove byte swap implementation
+
+- Fixes OS X 10.1 and 10.2 crackling
+- Clearly this register does something different than I expect...
+---
+ hw/audio/screamer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index f57d92c9a..98a216033 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -234,7 +234,7 @@ static void screamerspk_callback(void *opaque, int free_b)
+ static void screamer_update_settings(ScreamerState *s)
+ {
+     struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16,
+-        s->regs[BYTE_SWAP_REG] ? 0 : 1 };
++        1 };
+ 
+     s->voice = AUD_open_out(s->be, s->voice, s_spk, s, screamerspk_callback, &as);
+     if (!s->voice) {

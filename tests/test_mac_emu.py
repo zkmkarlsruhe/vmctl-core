@@ -9,6 +9,8 @@ cold-snapshot semantics, the extfs wiring, and that host prereqs fail clearly.
 import json
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -231,9 +233,21 @@ def test_is_running_consults_pidfile_across_restart(tmp_path):
     so a retry does not duplicate-launch on the same display/port."""
     be = _sheep(tmp_path)
     be.instance_dir.mkdir(parents=True, exist_ok=True)
-    # a live pid (this test process) => running even with no in-memory handles
+    # a live pid whose argv carries our prefs path (as the real emulator's does)
+    # => running even with no in-memory handles
+    # not ``sh -c``: a shell may exec its single command in place, replacing the argv mid-test
+    live = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "--config", str(be.prefs_path)]
+    )
+    try:
+        be.pidfile_path.write_text(json.dumps({"emulator": live.pid}))
+        assert be._procs == {} and be.is_running() is True
+    finally:
+        live.kill()
+        live.wait()
+    # a live pid that is NOT our emulator (reboot / pid reuse) => not running
     be.pidfile_path.write_text(json.dumps({"emulator": os.getpid()}))
-    assert be._procs == {} and be.is_running() is True
+    assert be.is_running() is False
     # a reaped pid => not running
     dead = subprocess.Popen(["/bin/true"])
     dead.wait()
@@ -266,6 +280,30 @@ def test_no_guest_agent(tmp_path):
             call()
 
 
+# --- in-guest agent lane (research/70c rvmc-agent-68k, 70d) ------------------
+def test_agent_lane_prefs(tmp_path):
+    ser = BasiliskIIBackend("b", settings=_settings(tmp_path), disk="d.img", agent="serial")
+    p = ser.build_prefs()
+    assert p["seriala"] == str(ser.agent_pty_path)
+    assert "nvram" not in p and ser.nvram_path.name == ".basilisk_ii_xpram"
+    assert (p["modelid"], p["cpu"], p["fpu"]) == (14, 4, True)
+    http = BasiliskIIBackend(
+        "b", settings=_settings(tmp_path), disk="d.img", agent="http", agent_port=19009
+    )
+    assert http.build_prefs()["redir"] == "tcp:19009:10.0.2.15:9009"
+    with pytest.raises(BackendError):
+        BasiliskIIBackend("b", settings=_settings(tmp_path), disk="d.img", agent="http")
+    with pytest.raises(BackendError):
+        BasiliskIIBackend("b", settings=_settings(tmp_path), disk="d.img", agent="vioser")
+
+
+def test_extfs_never_omitted(tmp_path):
+    """No extfs line => the emulator exports "/" as the Unix volume (70d2): default to
+    an empty per-instance dir instead."""
+    be = BasiliskIIBackend("b", settings=_settings(tmp_path), disk="d.img")
+    assert be.build_prefs()["extfs"] == str(be.instance_dir / "extfs")
+
+
 # --- host prereqs fail clearly (research/52: "fail clearly if absent") ------
 def test_preflight_fails_without_binaries(tmp_path):
     be = _sheep(tmp_path)  # ROM path points at a non-existent file, bins not installed
@@ -281,3 +319,36 @@ def test_start_fails_clearly_without_rom(tmp_path):
     )
     with pytest.raises(BackendError):
         be.start()
+
+
+# --- research/70d2 §4 additions on top of the agent-lane patch --------------------------
+def test_sheepshaver_prefers_oldworld_rom(tmp_path):
+    s = _settings(tmp_path, oldworld_rom=str(tmp_path / "9630C68B.rom"))
+    be = SheepShaverBackend("i", settings=s, disk=str(tmp_path / "d.dsk"))
+    assert be.rom_path.endswith("9630C68B.rom")
+
+
+def test_sheepshaver_preflight_lowmem(tmp_path, monkeypatch):
+    be = _sheep(tmp_path)
+    real_read = type(tmp_path).read_text
+
+    def fake_read(self, *a, **k):
+        if str(self) == "/proc/sys/vm/mmap_min_addr":
+            return "65536\n"
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(type(tmp_path), "read_text", fake_read)
+    with pytest.raises(BackendError, match="mmap_min_addr"):
+        be._preflight_host()
+    be.settings.sheepshaver_rawio = True
+    be._preflight_host()  # host granted CAP_SYS_RAWIO
+
+
+def test_revert_drops_pram_newer_than_the_snapshot(tmp_path):
+    be = _sheep(tmp_path)
+    be.instance_dir.mkdir(parents=True)
+    Path(be.disk).write_bytes(b"disk")
+    be.snapshot_create("fresh")  # no PRAM yet
+    be.nvram_path.write_bytes(b"later pram")
+    be.snapshot_revert("fresh")
+    assert not be.nvram_path.exists()

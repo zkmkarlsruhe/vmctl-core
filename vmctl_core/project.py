@@ -38,6 +38,9 @@ class Registry:
         # a snapshot missing the other's change (silent lost update), and a read iterating while a
         # write pops/adds can raise "dict changed size during iteration". Reentrant so a mutator can
         # call save() (which also takes the lock) without deadlocking.
+        # LIMIT: the lock is PROCESS-LOCAL. A second process/worker on the same state dir
+        # bypasses it entirely — saves are atomic (no torn files) but last-writer-wins.
+        # The deployment contract is therefore ONE controller process per state dir.
         self._lock = threading.RLock()
         self.projects: dict[str, Project] = {}
         self.load()

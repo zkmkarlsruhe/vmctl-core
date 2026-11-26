@@ -1,0 +1,36 @@
+From 7cfe94f6f4e06c3bdfab77a9822e7abef90a0121 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Mon, 5 Oct 2026 15:53:15 +0200
+Subject: [PATCH 2/3] scsi-disk: fix the test for quirk_mode_page_truncated
+
+mode_select_pages() tests the quirk number instead of its bit:
+
+    if (!(s->quirks & SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED))
+
+SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED is 3, so this checks
+quirk_mode_page_apple_vendor and quirk_mode_sense_rom_use_dbd. On the
+q800 machine scsi-cd sets all of them, which hides the bug, but a
+device with only quirk_mode_page_truncated=on still rejects truncated
+pages, and one with only quirk_mode_page_apple_vendor=on accepts them.
+
+Fixes: 389e18eb9aa4 ("scsi-disk: add SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED quirk for Macintosh")
+---
+ hw/scsi/scsi-disk.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 673c8b3be0..a0dd3fec39 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -1636,7 +1636,7 @@ static int mode_select_pages(SCSIDiskReq *r, uint8_t *p, int len, bool change)
+             goto invalid_param;
+         }
+         if (page_len > len) {
+-            if (!(s->quirks & SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED)) {
++            if (!(s->quirks & (1 << SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED))) {
+                 goto invalid_param_len;
+             }
+             trace_scsi_disk_mode_select_page_truncated(page, page_len, len);
+-- 
+2.43.0
+

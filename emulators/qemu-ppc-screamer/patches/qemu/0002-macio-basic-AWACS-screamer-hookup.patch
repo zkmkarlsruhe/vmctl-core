@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+Date: Sat, 12 Nov 2016 16:39:17 +0000
+Subject: [PATCH 02/16] macio: basic AWACS/screamer hookup
+
+Signed-off-by: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+---
+ hw/audio/screamer.c           | 19 ++++++++++++++++---
+ hw/misc/macio/macio.c         | 10 +++++++++-
+ include/hw/audio/screamer.h   |  3 +++
+ include/hw/misc/macio/macio.h |  2 ++
+ 4 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index 5d656b8e8..b46df5fcd 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -24,6 +24,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "hw/hw.h"
++#include "qemu/audio.h"
+ #include "hw/audio/screamer.h"
+ #include "hw/qdev-properties.h"
+ #include "qemu/timer.h"
+@@ -32,7 +33,7 @@
+ #include "qemu/log.h"
+ 
+ /* debug screamer */
+-//#define DEBUG_SCREAMER
++#define DEBUG_SCREAMER
+ 
+ #ifdef DEBUG_SCREAMER
+ #define SCREAMER_DPRINTF(fmt, ...)                                  \
+@@ -54,12 +55,19 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
+ 
+ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+ {
+-    return 0;
++    uint32_t val;
++
++    val = 0;
++    SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " -> %x\n", __func__, addr, val);
++
++    return val;
+ }
+ 
+ static void screamer_write(void *opaque, hwaddr addr,
+                            uint64_t val, unsigned size)
+ {
++    SCREAMER_DPRINTF("%s: addr " HWADDR_FMT_plx " val %" PRIx64 "\n", __func__, addr, val);
++
+     return;
+ }
+ 
+@@ -74,17 +82,22 @@ static void screamer_initfn(Object *obj)
+     SysBusDevice *d = SYS_BUS_DEVICE(obj);
+     ScreamerState *s = SCREAMER(obj);
+ 
+-    memory_region_init_io(&s->mem, obj, &screamer_ops, s, "screamer", 0x2000);
++    memory_region_init_io(&s->mem, obj, &screamer_ops, s, "screamer", 0x1000);
+     sysbus_init_mmio(d, &s->mem);
+     sysbus_init_irq(d, &s->irq);
+ }
+ 
++static const Property screamer_properties[] = {
++    DEFINE_AUDIO_PROPERTIES(ScreamerState, be),
++};
++
+ static void screamer_class_init(ObjectClass *oc, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(oc);
+ 
+     dc->realize = screamer_realizefn;
+     dc->legacy_reset = screamer_reset;
++    device_class_set_props(dc, screamer_properties);
+ }
+ 
+ static const TypeInfo screamer_type_info = {
+diff --git a/hw/misc/macio/macio.c b/hw/misc/macio/macio.c
+index 2813705c0..6142d396b 100644
+--- a/hw/misc/macio/macio.c
++++ b/hw/misc/macio/macio.c
+@@ -102,6 +102,13 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
+     memory_region_add_subregion(&s->bar, 0x08000,
+                                 sysbus_mmio_get_region(sbd, 0));
+ 
++    if (!qdev_realize(DEVICE(&s->screamer), BUS(&s->macio_bus), errp)) {
++        return false;
++    }
++    sbd = SYS_BUS_DEVICE(&s->screamer);
++    memory_region_add_subregion(&s->bar, 0x14000,
++                                sysbus_mmio_get_region(sbd, 0));
++
+     qdev_prop_set_uint32(DEVICE(&s->escc), "disabled", 0);
+     qdev_prop_set_uint32(DEVICE(&s->escc), "frequency", ESCC_CLOCK);
+     qdev_prop_set_uint32(DEVICE(&s->escc), "it_shift", 4);
+@@ -110,7 +117,6 @@ static bool macio_common_realize(PCIDevice *d, Error **errp)
+     if (!qdev_realize(DEVICE(&s->escc), BUS(&s->macio_bus), errp)) {
+         return false;
+     }
+-
+     macio_bar_setup(s);
+     pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+ 
+@@ -373,6 +379,8 @@ static void macio_instance_init(Object *obj)
+     object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
+ 
+     object_initialize_child(obj, "escc", &s->escc, TYPE_ESCC);
++
++    object_initialize_child(obj, "screamer", &s->screamer, TYPE_SCREAMER);
+ }
+ 
+ static const VMStateDescription vmstate_macio_oldworld = {
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+index c6438df5c..58ec93b57 100644
+--- a/include/hw/audio/screamer.h
++++ b/include/hw/audio/screamer.h
+@@ -27,6 +27,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "hw/sysbus.h"
++#include "qemu/audio.h"
+ 
+ #define TYPE_SCREAMER "screamer"
+ OBJECT_DECLARE_SIMPLE_TYPE(ScreamerState, SCREAMER)
+@@ -38,6 +39,8 @@ struct ScreamerState {
+     /*< public >*/
+     MemoryRegion mem;
+     qemu_irq irq;
++
++    AudioBackend *be;
+ };
+ 
+ #endif
+diff --git a/include/hw/misc/macio/macio.h b/include/hw/misc/macio/macio.h
+index 16aa95b87..56f5e3d38 100644
+--- a/include/hw/misc/macio/macio.h
++++ b/include/hw/misc/macio/macio.h
+@@ -36,6 +36,7 @@
+ #include "hw/nvram/mac_nvram.h"
+ #include "hw/ppc/mac_dbdma.h"
+ #include "hw/ppc/openpic.h"
++#include "hw/audio/screamer.h"
+ #include "qom/object.h"
+ 
+ /* Old World IRQs */
+@@ -112,6 +113,7 @@ struct MacIOState {
+     PMUState pmu;
+     DBDMAState dbdma;
+     ESCCState escc;
++    ScreamerState screamer;
+     uint64_t frequency;
+ };
+ 

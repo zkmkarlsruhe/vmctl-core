@@ -38,12 +38,28 @@ class Hardware(BaseModel):
     # everything, incl. the qemu-system-ppc mac9 (9.2.2) tier; 'basilisk2' for
     # m68k. Set 'sheepshaver' (PPC, 8.1-9.0.4 NewWorld-ROM) or 'basilisk2' (68k,
     # System 7-8.1) to run a classic-Mac base under the SDL2/Xvfb/x11vnc emulator
-    # backend instead of libvirt. These two need a Mac ROM (a host prereq — see
+    # backend instead of libvirt. 'q800' = qemu-system-m68k -M q800 as a process with
+    # QMP + VNC (libvirt refuses m68k domains, research/70c §7.1). These two need a Mac ROM (a host prereq — see
     # 'rom' below + VMCTL_* env; NOT baked into a base — research/18).
     backend: str = ""
+    process: dict = Field(default_factory=dict)  # ProcessSpec template, including pinned media
     rom: str = ""  # per-base Mac ROM path override for sheepshaver/basilisk2.
     # '' => the deployment ROM from config (VMCTL_NEWWORLD_ROM / VMCTL_ROM_68K).
+    # q800: the golden PRAM image (qcow2, relative to the catalog like `path`). Carries
+    # 32-bit addressing + startup settings (research/70b §3.4); cloned per instance.
+    nvram: str = ""
+    # Pin the host ROM a base needs (q800: checksum F1ACAD13). The ROM itself stays a
+    # host prerequisite (VMCTL_ROM_68K / `rom`), never inside a base or bundle.
+    rom_checksum: str = ""  # first 4 bytes of the ROM, hex, e.g. 'F1ACAD13'
+    rom_sha256: str = ""
+    # q800: the emulator container image the golden was built + verified on. The id
+    # (sha256 config digest, `docker image inspect -f {{.Id}}`) is what runs; the reference
+    # (e.g. harbor.zkm.de/mutech/vmctl-emu/qemu-m68k:11.1.1-zkm1) says where to pull it.
+    # '' => the host's qemu-system-m68k (VMCTL_QEMU_M68K_BIN).
+    emulator_image: str = ""
+    emulator_image_id: str = ""
     mac_screen: str = ""  # sheepshaver/basilisk SDL2 screen, e.g. 'win/1024/768'
+    # (q800: the `-g` mode, e.g. '640x480x8'; '' => 640x480x8)
     # (windowed => the 1:1 hardware-cursor mouse path, research/52 §5).
     # '' => 'win/1024/768'. NOT 'dga'.
     # Per-base QEMU binary. None => deployment x86 default (DEFAULT_EMULATOR /
@@ -59,6 +75,10 @@ class Hardware(BaseModel):
     blank_disk_gb: int = 0  # >0 => clone makes a fresh empty qcow2 of this size instead of a
     # CoW overlay (no golden base yet — e.g. an OS-install project VM)
     audio_sink: str = ""  # screamer -audiodev pa out.name (per-VM null sink); '' => no audio arg
+    # Guest sound for rvmc's browser audio: a libvirt <sound> model whose driver ships in the
+    # guest (ac97, ich6, ich9, sb16, es1370), 'onboard' (ppc screamer, q800 ASC), or '' = none.
+    # rvmc enables host capture into the per-VM null sink for every new instance when set.
+    sound: str = ""
     prom_env: list[str] = (
         Field(  # OpenBIOS prom-env vars via <qemu:commandline> (no native libvirt field)
             default_factory=lambda: ["auto-boot?=true", "boot-args=-v", "vga-ndrv?=true"]
@@ -81,21 +101,6 @@ class Hardware(BaseModel):
     agent_channel: bool = True  # emit the virtio-serial agentbox channel (needs vioser in guest;
     # False for pristine XP so it boots driver-wizard-free)
     virtio_serial: bool = True  # virtio-serial controller + qemu-ga channel (needs vioser driver)
-    mgmt_nic: bool = False  # emit an ADDITIONAL isolated host-only NIC on the 'rvmc-mgmt'
-    # network (private 10.77.0.0/24, no forward). Containment for the legacy-TCP agent
-    # transport: guests with no virtio-serial (win2000/win98/irix) run the agentbox on
-    # TCP:9009; this puts that lane on an isolated NIC the untrusted artwork LAN can't
-    # reach, and guest_ip() then prefers the 10.77.0.x lease so the controller/tcp_helper
-    # dial the mgmt IP, not the artwork NIC. Off by default => single-NIC domains unchanged.
-    control_nic: bool = False  # ALIAS for mgmt_nic, named for the dual-pipeline role. Same
-    # emit (the isolated 10.77/24 NIC), but reads right on a VIRTIO-SERIAL golden where the
-    # NIC is not a legacy-TCP containment hack but the P3 dual-pipeline FALLBACK path:
-    # TCP-over-control-NIC that survives a vioser-driver wedge. mgmt_nic OR control_nic
-    # triggers the emit (see control_nic_enabled); existing mgmt_nic users are unaffected.
-    control_nic_model: str = ""  # model for the isolated control/mgmt NIC. '' => e1000 on a
-    # virtio-serial golden (see control_nic_model_effective), else falls back to nic_model so
-    # legacy-TCP domains stay byte-identical. e1000 is deliberate: a driver INDEPENDENT of the
-    # virtio-serial that may wedge — that independence is the whole point of the TCP fallback.
     memballoon: str = "virtio"  # 'none' for guests without the balloon driver (pristine XP)
 
     # --- macOS-x86 (Hackintosh-style, e.g. Snow Leopard 10.6) knobs. Inert unless
@@ -117,24 +122,6 @@ class Hardware(BaseModel):
     def disk_dev(self) -> str:
         return _DISK_DEV.get(self.disk_bus, "vda")
 
-    @property
-    def control_nic_enabled(self) -> bool:
-        """Emit the isolated control/mgmt NIC? True for either flag — mgmt_nic (legacy-TCP
-        containment) or control_nic (the dual-pipeline TCP fallback role). Both render the
-        same NIC on rvmc-mgmt; the alias exists only so a vioser golden reads correctly."""
-        return self.mgmt_nic or self.control_nic
-
-    @property
-    def control_nic_model_effective(self) -> str:
-        """NIC model for the isolated control/mgmt NIC. Explicit control_nic_model wins;
-        otherwise e1000 on a virtio-serial golden — a driver INDEPENDENT of the vioser that
-        may wedge, so the TCP-over-control-NIC fallback keeps working when the primary agent
-        transport is dead (that independence is the entire point). On a legacy-TCP base (no
-        virtio-serial) it falls back to nic_model, keeping those domains byte-identical."""
-        if self.control_nic_model:
-            return self.control_nic_model
-        return "e1000" if self.virtio_serial else self.nic_model
-
     # libvirt wants these in KiB
     @property
     def vgamem_kib(self) -> int:
@@ -149,6 +136,10 @@ class Hardware(BaseModel):
         return self.qxl_vram_mb * 1024
 
 
+def _os_key(name: str) -> str:
+    return (name or "").strip().lower().replace(" ", "-")
+
+
 class BaseImage(BaseModel):
     """One catalog entry — an immutable golden qcow2 + how to boot it."""
 
@@ -156,9 +147,17 @@ class BaseImage(BaseModel):
     name: str | None = None  # human-friendly display name (UI falls back to id)
     path: str  # qcow2 path (abs, or relative to the catalog file)
     os: str  # free-form label, e.g. "windows-xp", "linux"
+    # Broader OS classes this base also runs (artwork-autopsy's base picks, e.g. "windows-9x",
+    # "osx-legacy"): the analysis pre-fills a base whose os OR os_aliases names its pick.
+    os_aliases: list[str] = Field(default_factory=list)
     agent: bool = False  # qemu-guest-agent available in this guest?
     notes: str | None = None
     hw: Hardware = Field(default_factory=Hardware)
+
+    def runs(self, os_name: str) -> bool:
+        """Whether this base runs ``os_name`` (its os or an alias; case and spaces ignored)."""
+        want = _os_key(os_name)
+        return bool(want) and any(_os_key(o) == want for o in (self.os, *self.os_aliases))
 
     def resolved_path(self, catalog_dir: Path) -> Path:
         p = Path(self.path)

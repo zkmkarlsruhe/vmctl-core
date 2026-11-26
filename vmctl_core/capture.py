@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import contextlib
 import os
+import pwd
 import shlex
+import struct
 import subprocess
+import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -29,6 +34,32 @@ _FIELDS = [
     "frame.len",
     "_ws.col.Info",
 ]
+
+
+# Classic pcap magic (as stored on disk) -> (struct byte order, timestamp fraction unit).
+# tcpdump -w writes classic pcap; pcapng or anything else falls back to the full read.
+_PCAP_MAGIC = {
+    b"\xd4\xc3\xb2\xa1": ("<", 1e-6),
+    b"\xa1\xb2\xc3\xd4": (">", 1e-6),
+    b"\x4d\x3c\xb2\xa1": ("<", 1e-9),
+    b"\xa1\xb2\x3c\x4d": (">", 1e-9),
+}
+# recent() keeps the offsets of this many newest records per instance; a larger count
+# falls back to the full tshark read.
+_TAIL_MAX = 5000
+_MAX_RECORD = 1 << 26  # a record header claiming more than 64 MB = not a pcap record
+
+
+@dataclass
+class _TailIndex:
+    """Incremental record index of one growing pcap: where the scan stopped, how many
+    complete records precede that point, and the (offset, timestamp) of the newest ones."""
+
+    key: tuple
+    offset: int = 24
+    count: int = 0
+    first_ts: float | None = None
+    ring: deque = field(default_factory=lambda: deque(maxlen=_TAIL_MAX))
 
 
 class NetworkMonitor:
@@ -48,6 +79,8 @@ class NetworkMonitor:
         # writes corrupt the capture). Different instances still capture concurrently.
         self._start_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._tail: dict[str, _TailIndex] = {}
+        self._tail_lock = threading.Lock()
 
     def _lock_for(self, iid: str) -> threading.Lock:
         with self._locks_guard:
@@ -78,17 +111,24 @@ class NetworkMonitor:
         return self._pidfile_alive(iid)
 
     @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        """True if `pid` is a live process. A sudo tcpdump runs as root, so a
-        non-root controller gets EPERM from ``kill(pid, 0)`` — that still means
-        the process EXISTS, so treat it as alive."""
+    def _pid_alive(pid: int, pcap: Path) -> bool:
+        """True if `pid` is a live process AND is our tcpdump for `pcap`. A sudo
+        tcpdump runs as root, so a non-root controller gets EPERM from
+        ``kill(pid, 0)`` — that still means the process EXISTS, so treat it as
+        alive. After a reboot / OOM kill the pidfile outlives the process and the
+        number gets reused, so also require ``-w <pcap>`` on the process's command
+        line (``/proc/<pid>/cmdline`` is world-readable); a mismatch is dead."""
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True
-        return True
+            pass
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return True  # no procfs: trust the signal-0 probe
+        return str(pcap).encode() in cmdline.split(b"\0")
 
     def _pidfile_alive(self, iid: str) -> bool:
         """True only if the recorded pidfile names a still-alive process. A stale
@@ -100,7 +140,7 @@ class NetworkMonitor:
             pid = int(pidfile.read_text().strip())
         except (ValueError, OSError):
             return False
-        if self._pid_alive(pid):
+        if self._pid_alive(pid, self.pcap_path(iid)):
             return True
         pidfile.unlink(missing_ok=True)
         return False
@@ -128,7 +168,7 @@ class NetworkMonitor:
 
         ``exclude`` is an optional BPF sub-expression for traffic that must NEVER
         enter the pcap — e.g. the research/58 Mac OS 9 agent's HTTP port
-        (``tcp port 9610``), so the conservator's stored capture stays clean of
+        (``tcp port 9009``), so the conservator's stored capture stays clean of
         rvmc's own control traffic (research/58 §3.3). It is ANDed as
         ``and not ( <exclude> )`` into the tcpdump CAPTURE filter (authoritative —
         the frames are dropped at capture time, not just hidden in the UI). The
@@ -163,18 +203,27 @@ class NetworkMonitor:
         # its filter expression. Every interpolated value (paths, tap name) is
         # shell-quoted so a space / shell metacharacter in the capture dir / iid / tap
         # can't corrupt the redirect or inject into the root shell.
+        # -Z drops tcpdump's privileges to the controller user AFTER opening the tap but
+        # BEFORE opening the savefile (tcpdump 4.99), so the pcap is owned by us and not
+        # by the default `tcpdump` user — otherwise the drive dir cannot be purged later.
+        user = shlex.quote(pwd.getpwuid(os.getuid()).pw_name)
         script = (
             f"echo $$ > {shlex.quote(str(pidfile))}; "
-            f'exec tcpdump -i {shlex.quote(str(tap))} -U -s 0 -w {shlex.quote(str(pcap))} "$@"'
+            f"exec tcpdump -Z {user} -i {shlex.quote(str(tap))} -U -s 0 "
+            f'-w {shlex.quote(str(pcap))} "$@"'
         )
         argv = ["sudo", "-n", "sh", "-c", script, "sh"]
         if bpf:
             argv.append(bpf)
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # stderr goes to <iid>.log: a sudo/tcpdump/tap failure exits within milliseconds
+        # and would otherwise look like "the artwork made no traffic".
+        log = self._dir(iid) / f"{iid}.log"
+        with log.open("wb") as lf:
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=lf)
+        time.sleep(0.3)
+        if proc.poll() is not None:
+            tail = log.read_text(errors="replace")[-600:].strip()
+            raise RuntimeError(f"capture failed to start (exit {proc.returncode}): {tail}")
         self._procs[iid] = proc
         return self.status(iid)
 
@@ -237,6 +286,9 @@ class NetworkMonitor:
         # nothing to kill (is_capturing() already treats an unparseable pidfile as
         # not-capturing); an empty pidfile WITH a live proc is the disk-anomaly case where
         # we can't target the pid, so we do NOT declare it dead.
+        # Stale pidfile (reboot / pid reuse): the number is not our tcpdump, never kill it.
+        if pid.isdigit() and proc is None and not self._pid_alive(int(pid), self.pcap_path(iid)):
+            pid = ""
         dead = not pid and not proc_live
         if pid:
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -283,8 +335,88 @@ class NetworkMonitor:
         }
 
     def recent(self, iid: str, count: int = 100) -> list[dict]:
-        """Last `count` packets parsed from the pcap (newest last)."""
+        """Last `count` packets parsed from the pcap (newest last).
+
+        Dissects only the tail: a busy guest writes ~200 MB/min, and letting tshark
+        dissect the whole file ran into the 30 s timeout (HTTP 500 in the raw-packet
+        view). The record headers are indexed incrementally (only bytes appended since
+        the last call are scanned), the newest `count` records are copied into a small
+        pcap, and frame number / relative time are shifted back to whole-file values."""
+        if count <= 0:
+            return []
+        pcap = self.pcap_path(iid)
+        if not pcap.exists():
+            return []
+        if count <= _TAIL_MAX:
+            with self._tail_lock:
+                tail = self._tail_slice(iid, pcap, count)
+            if tail is not None:
+                path, skipped, dt = tail
+                try:
+                    rows = self._read_pcap(path, None, count)
+                finally:
+                    path.unlink(missing_ok=True)
+                for r in rows:
+                    with contextlib.suppress(ValueError):
+                        r["no"] = str(int(r["no"]) + skipped)
+                    with contextlib.suppress(ValueError):
+                        r["time"] = f"{float(r['time']) + dt:.9f}"
+                return rows
         return self._read(iid, display_filter=None, count=count)
+
+    def _tail_slice(self, iid: str, pcap: Path, count: int) -> tuple[Path, int, float] | None:
+        """Write the newest `count` complete records of `pcap` into a temp pcap.
+
+        Returns (temp path, records before the slice, slice-first minus file-first
+        timestamp), or None when the file can't be indexed (unreadable legacy capture
+        owned by another user, pcapng, corrupt header) -> caller does the full read."""
+        try:
+            f = pcap.open("rb")
+        except OSError:
+            return None
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            head = f.read(40)
+            if len(head) < 24 or head[:4] not in _PCAP_MAGIC:
+                return None
+            order, unit = _PCAP_MAGIC[head[:4]]
+            # tcpdump -w truncates the same inode on a restart: the global header plus the
+            # first record header tell a new capture from the one already indexed.
+            key = (os.fstat(f.fileno()).st_ino, head)
+            idx = self._tail.get(iid)
+            if idx is None or idx.key != key or size < idx.offset:
+                idx = self._tail[iid] = _TailIndex(key=key)
+            hdr = struct.Struct(order + "IIII")
+            f.seek(idx.offset)
+            while True:
+                h = f.read(16)
+                if len(h) < 16:
+                    break
+                sec, frac, incl, _orig = hdr.unpack(h)
+                if incl > _MAX_RECORD:
+                    self._tail.pop(iid, None)
+                    return None
+                end = idx.offset + 16 + incl
+                if end > size:
+                    break  # record still being written (-U flushes per packet)
+                ts = sec + frac * unit
+                if idx.first_ts is None:
+                    idx.first_ts = ts
+                idx.ring.append((idx.offset, ts))
+                idx.count += 1
+                idx.offset = end
+                f.seek(end)
+            if not idx.ring:
+                return None
+            take = min(count, len(idx.ring))
+            start, start_ts = idx.ring[-take]
+            f.seek(start)
+            body = f.read(idx.offset - start)
+        fd, name = tempfile.mkstemp(prefix=f"{iid}-tail-", suffix=".pcap")
+        with os.fdopen(fd, "wb") as out:
+            out.write(head[:24])
+            out.write(body)
+        return Path(name), idx.count - take, start_ts - (idx.first_ts or start_ts)
 
     def search(self, iid: str, display_filter: str, count: int = 200) -> list[dict]:
         """Packets matching a tshark display filter — lets the AI 'catch' specific
@@ -295,6 +427,9 @@ class NetworkMonitor:
         pcap = self.pcap_path(iid)
         if not pcap.exists():
             return []
+        return self._read_pcap(pcap, display_filter, count)
+
+    def _read_pcap(self, pcap: Path, display_filter: str | None, count: int) -> list[dict]:
         cmd = [
             "sudo",
             "-n",
@@ -333,7 +468,7 @@ class NetworkMonitor:
                     "info": c[6],
                 }
             )
-        return rows[-count:]
+        return rows[-count:] if count > 0 else []  # rows[-0:] would be the whole pcap
 
     # === capture_summary (research/31): digest, not packet dump =============
     # "What does this artwork try to reach?" — the conservation question. The raw
@@ -412,6 +547,7 @@ class NetworkMonitor:
         "http.request.full_uri",
         "ip.dst",
         "tcp.stream",
+        "http.request.line",
     ]
     # response-side fields (one row per response frame)
     _RESP_FIELDS: ClassVar = [
@@ -425,6 +561,7 @@ class NetworkMonitor:
         "http.location",
         "ip.src",
         "tcp.stream",
+        "http.response.line",
     ]
 
     @staticmethod
@@ -493,26 +630,14 @@ class NetworkMonitor:
                        body_preview?,archived?},
              timing:{request_ts,response_ts,elapsed_ms}}
         """
-        # request rows (+ headers as a separate all-occurrence query)
-        req_rows = self._tshark_fields(pcap, "http.request", self._REQ_FIELDS)
-        req_hdr_rows = self._tshark_fields(
-            pcap,
-            "http.request",
-            ["frame.number", "http.request.line"],
-            occurrence="a",
-            aggregator=self._AGG,
+        # One pass per side: the header lines (http.*.line, multi-valued) ride along
+        # with the single-valued fields, for which occurrence=a is a no-op.
+        req_rows = self._tshark_fields(
+            pcap, "http.request", self._REQ_FIELDS, occurrence="a", aggregator=self._AGG
         )
-        req_hdrs = {r[0]: self._split_headers(r[1], self._AGG) for r in req_hdr_rows}
-
-        resp_rows = self._tshark_fields(pcap, "http.response", self._RESP_FIELDS)
-        resp_hdr_rows = self._tshark_fields(
-            pcap,
-            "http.response",
-            ["frame.number", "http.response.line"],
-            occurrence="a",
-            aggregator=self._AGG,
+        resp_rows = self._tshark_fields(
+            pcap, "http.response", self._RESP_FIELDS, occurrence="a", aggregator=self._AGG
         )
-        resp_hdrs = {r[0]: self._split_headers(r[1], self._AGG) for r in resp_hdr_rows}
 
         body_map: dict[str, str] = {}
         if with_bodies:
@@ -525,8 +650,8 @@ class NetworkMonitor:
         requests: dict[str, dict] = {}
         order: list[str] = []
         stream_reqs: dict[str, list[str]] = {}  # stream -> unmatched req frames (FIFO)
-        for fno, ts, resp_in, method, host, uri, full_uri, dst, stream in req_rows:
-            lines = req_hdrs.get(fno, [])
+        for fno, ts, resp_in, method, host, uri, full_uri, dst, stream, hdr_cell in req_rows:
+            lines = self._split_headers(hdr_cell, self._AGG)
             requests[fno] = {
                 "frame": int(fno) if fno.isdigit() else fno,
                 "method": method,
@@ -545,8 +670,20 @@ class NetworkMonitor:
 
         # attach responses to their request via http.request_in
         responses: dict[str, dict] = {}  # req-frame -> response dict
-        for fno, ts, req_in, code, phrase, ctype, clen, location, _src, stream in resp_rows:
-            lines = resp_hdrs.get(fno, [])
+        for (
+            fno,
+            ts,
+            req_in,
+            code,
+            phrase,
+            ctype,
+            clen,
+            location,
+            _src,
+            stream,
+            hdr_cell,
+        ) in resp_rows:
+            lines = self._split_headers(hdr_cell, self._AGG)
             hdr_map = self._headers_to_dict(lines)
             content_type = ctype.split(";")[0].strip() if ctype else ""
             resp = {
@@ -577,7 +714,7 @@ class NetworkMonitor:
         # Keep the NEWEST max_items (tail of capture order), not the oldest — a
         # long-running capture should surface current traffic, matching recent()'s
         # rows[-count:]. Chronological (request) order within the window is preserved.
-        for fno in order[-max_items:]:
+        for fno in order[-max_items:] if max_items > 0 else []:
             req = requests[fno]
             bound = responses.get(fno)
             timing = {
@@ -656,10 +793,16 @@ class NetworkMonitor:
         pcap = self.pcap_path(iid)
         if not pcap.exists() or pcap.stat().st_size == 0:
             return {"transactions": [], "pcap": None}
-        return {
-            "transactions": self._http_transactions(pcap, max_items, with_bodies=with_bodies),
-            "pcap": pcap.name,
-        }
+        out: dict[str, Any] = {"transactions": [], "pcap": pcap.name}
+        try:
+            out["transactions"] = self._http_transactions(pcap, max_items, with_bodies=with_bodies)
+        except subprocess.TimeoutExpired as e:
+            out["error"] = self._timeout_msg(e)
+        return out
+
+    @staticmethod
+    def _timeout_msg(e: subprocess.TimeoutExpired) -> str:
+        return f"tshark timed out after {e.timeout:g}s; digest is partial"
 
     def summarize(self, iid: str, max_items: int = 50) -> dict:
         """Compact digest of a VM's captured traffic for the AI / conservation UI.
@@ -682,13 +825,21 @@ class NetworkMonitor:
         }
         if not pcap.exists() or pcap.stat().st_size == 0:
             return empty
+        out = {**empty, "pcap": pcap.name}
+        try:
+            self._summarize_into(out, pcap, max_items)
+        except subprocess.TimeoutExpired as e:
+            # Every section filled so far stays; the UI shows the partial digest.
+            out["error"] = self._timeout_msg(e)
+        return out
 
+    def _summarize_into(self, out: dict[str, Any], pcap: Path, max_items: int) -> None:
         # --- HTTP: real request<->response binding via http.request_in ----
         # (no tcp.stream guessing — keep-alive/pipelining safe). Bodies are
         # omitted here to keep the digest small; the detail view fetches them.
-        txns = self._http_transactions(pcap, max_items, with_bodies=False)
+        txns = out["transactions"] = self._http_transactions(pcap, max_items, with_bodies=False)
         # flat request-centric list for the host roll-up + anomaly flags
-        http = []
+        http: list[dict] = out["http"]
         for t in txns:
             req, resp = t["request"], t.get("response")
             http.append(
@@ -715,7 +866,9 @@ class NetworkMonitor:
                 v = v.strip()
                 if v:
                     ans.add(v)
-        dns = [{"name": n, "answers": sorted(a)} for n, a in sorted(dns_map.items())][:max_items]
+        out["dns"] = [{"name": n, "answers": sorted(a)} for n, a in sorted(dns_map.items())][
+            :max_items
+        ]
 
         # --- TLS SNI: the https hostnames (encrypted payload, clear SNI) ---
         sni_rows = self._tshark_fields(
@@ -724,27 +877,16 @@ class NetworkMonitor:
             ["tls.handshake.extensions_server_name"],
             occurrence="a",
         )
-        sni = sorted({c[0].strip() for c in sni_rows if c[0].strip()})[:max_items]
+        sni = out["tls_sni"] = sorted({c[0].strip() for c in sni_rows if c[0].strip()})[:max_items]
 
         # --- conversations + non-web peers via conv,tcp -------------------
-        conversations, other = self._conversations(pcap, max_items)
+        out["conversations"], out["other"] = self._conversations(pcap, max_items)
 
         # --- protocol hierarchy counts (the 'something else' radar) -------
-        counts = self._proto_counts(pcap)
+        counts = out["counts"] = self._proto_counts(pcap)
         counts.update(
             {"http_requests": len(http), "dns_names": len(dns_map), "tls_sni_hosts": len(sni)}
         )
-
-        return {
-            "http": http,
-            "transactions": txns,
-            "dns": dns,
-            "tls_sni": sni,
-            "other": other,
-            "conversations": conversations,
-            "counts": counts,
-            "pcap": pcap.name,
-        }
 
     def _conversations(self, pcap: Path, max_items: int) -> tuple[list[dict], list[dict]]:
         """Parse `tshark -z conv,tcp` into per-peer rows; flag non-web peers."""

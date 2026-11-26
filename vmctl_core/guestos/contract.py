@@ -148,6 +148,10 @@ class BaseGuestOSModule:
 
     os_labels: tuple[str, ...] = ()
     display_name: str = "unknown"
+    # Guest-side gain of the usb-tablet around the screen centre: a raw absolute point p
+    # lands at c + gain*(p - c). 1.0 = 1:1. Hosts sending absolute pointer events divide
+    # by it so a click lands on the framebuffer pixel it targets.
+    abs_pointer_gain: float = 1.0
 
     def caps(self) -> Capabilities:
         return Capabilities()

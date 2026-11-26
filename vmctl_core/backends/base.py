@@ -86,8 +86,9 @@ class VMBackend(Protocol):
     def screenshot(self, screen: int = 0) -> bytes:
         """PNG bytes of a display head, captured with no guest cooperation."""
 
-    def vnc_endpoint(self) -> tuple[str, int] | None:
-        """(host, port) of the domain's VNC server, or None if not graphical."""
+    def vnc_endpoint(self) -> tuple[str, int | str] | None:
+        """(host, port) of the domain's VNC server, or None if not graphical. A unix
+        socket is ``("unix_socket", <path>)`` (websockify's TokenFile target syntax)."""
 
     def send_key(self, keys: list[str]) -> None:
         """Inject keystrokes at the hypervisor (KEY_* names), e.g. ['KEY_ESC'] or

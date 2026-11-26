@@ -44,7 +44,7 @@ All changes are **ppc-guarded**; winxp/win10/debian x86 guests are unaffected.
 `"os9" + first 8 hex of sha1(domain_name)` — deterministic (same domain ⇒ same tap, so create
 is idempotent and delete is exact) and 11 chars (≤ IFNAMSIZ-1).
 
-## Test result (live, on vmctl-lab box 192.168.233.204)
+## Test result (live, on the lab host)
 
 Cloned `mac9` (golden `mac9-922-agent-golden.qcow2`, `agent:true`) into project `verify`:
 
@@ -63,8 +63,8 @@ Cloned `mac9` (golden `mac9-922-agent-golden.qcow2`, `agent:true`) into project 
 
 ## Host-config caveats
 
-- qemu runs as the deploying user (`scharc`); the tap is created `user scharc`. The qemu user
-  is overridable via `RVMC_QEMU_USER` (default `scharc`).
+- qemu runs as the deploying user; the tap is created `user <that user>`. The qemu user
+  is overridable via `RVMC_QEMU_USER` (default: the user running the controller).
 - Requires passwordless `sudo ip` on the host (present on the box).
 - Requires the host-side libvirt qemu.conf already having `namespaces=[]` + `/dev/net/tun` in
   `cgroup_device_acl` so qemu (as a non-root user, no namespacing) can open the pre-made tap.

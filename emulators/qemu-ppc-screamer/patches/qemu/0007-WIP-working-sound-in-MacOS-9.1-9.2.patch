@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+Date: Fri, 18 Nov 2016 20:05:16 +0000
+Subject: [PATCH 07/16] WIP: working sound in MacOS 9.1/9.2
+
+---
+ hw/audio/screamer.c           | 134 +++++++++++++++++++++-------------
+ hw/misc/macio/macio.c         |   6 +-
+ include/hw/audio/screamer.h   |   5 +-
+ include/hw/misc/macio/macio.h |   3 +
+ 4 files changed, 94 insertions(+), 54 deletions(-)
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index 29a9ed135..4400895b2 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -53,24 +53,31 @@
+ #define CODEC_STAT_REG 0x2
+ #define CLIP_CNT_REG   0x3
+ #define BYTE_SWAP_REG  0x4
++#define FRAME_CNT_REG  0x5
+ 
+-#define CODEC_CTRL_MASKECMD     (0x1 << 24)
+-#define CODEC_STAT_MASK_VALID   (0x1 << 22) 
++#define CODEC_CTRL_MASKECMD        (0x1 << 24)
++#define CODEC_CTRL1_RECALIBRATE    0x4
++
++#define CODEC_STAT_MANUFACTURER_CRYSTAL    0x100
++#define CODEC_STAT_AWACS_REVISION          0x3000
++#define CODEC_STAT_MASK_VALID              (0x1 << 22) 
+ 
+ /* Audio */
+ static const char *s_spk = "screamer";
+ 
+-static void pmac_transfer(DBDMA_io *io)
++static void pmac_screamer_tx_transfer(DBDMA_io *io)
+ {
+     ScreamerState *s = io->opaque;     
+     
+-    SCREAMER_DPRINTF("DMA transfer: addr %" HWADDR_PRIx " len: %x  bpos: %d\n", io->addr, io->len, s->bpos);
++    SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
++                     " len: %x  bpos: %d\n", io->addr, io->len, s->bpos);
+        
+     dma_memory_read(&address_space_memory, io->addr, &s->buf[s->bpos], io->len,
+                     MEMTXATTRS_UNSPECIFIED);
+     
+-    /* Indicate success */
+     s->bpos += io->len;
++    
++    /* Indicate success */
+     io->len = 0;
+     
+     /* Finish */
+@@ -85,43 +92,62 @@ static void pmac_screamer_tx(DBDMA_io *io)
+         /* Not enough space in the buffer, so defer IRQ */
+         memcpy(&s->io, io, sizeof(DBDMA_io));
+ 
+-	SCREAMER_DPRINTF("DMA buffer full, defer interrupt!\n");
+-	
++        SCREAMER_DPRINTF("DMA TX defer interrupt!\n");
+         return;
+     }
+     
+     s->io.addr = 0;
+     s->io.len = 0;
+     
+-    pmac_transfer(io);
++    pmac_screamer_tx_transfer(io);
++}
++
++static void pmac_screamer_tx_flush(DBDMA_io *io)
++{
++    SCREAMER_DPRINTF("DMA TX flush!\n");
+ }
+ 
+-static void pmac_screamer_flush(DBDMA_io *io)
++static void pmac_screamer_rx(DBDMA_io *io)
+ {
+-    SCREAMER_DPRINTF("DMA flush!\n");
++    SCREAMER_DPRINTF("DMA RX transfer: addr %" HWADDR_PRIx
++                     " len: %x\n", io->addr, io->len);
++
++    ScreamerState *s = io->opaque;
++    DBDMAState *dbs = s->dbdma;
++    DBDMA_channel *ch = &dbs->channels[0x12];
++        
++    /* FIXME: stop channel after updating with status to stop MacOS 9 freezing */
++    ch->regs[DBDMA_STATUS] = 0x0;
++
++    io->dma_end(io);
+ }
+ 
+-void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel)
++static void pmac_screamer_rx_flush(DBDMA_io *io)
++{
++    SCREAMER_DPRINTF("DMA RX flush!\n");
++}
++
++void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel)
+ {
+     s->dbdma = dbdma;
+     DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
+-                           pmac_screamer_tx, pmac_screamer_flush, s);
++                           pmac_screamer_tx, pmac_screamer_tx_flush, s);
++    DBDMA_register_channel(dbdma, rxchannel, s->dma_rx_irq,
++                           pmac_screamer_rx, pmac_screamer_rx_flush, s);
+ }
+ 
+ static void screamerspk_callback(void *opaque, int avail)
+ {
+     ScreamerState *s = opaque;
+     int n, len;
+-    
+-    //SCREAMER_DPRINTF("speaker callback! %d\n", avail);
+ 
+     if (s->bpos) {
+         if (s->ppos < s->bpos) {
+-	    n = MIN(s->bpos - s->ppos, (unsigned int)avail);
+-	    //printf("########### AUDIO WRITE! %d / %d - %d\n", s->ppos, s->bpos, n);
++            n = MIN(s->bpos - s->ppos, (unsigned int)avail);
++            SCREAMER_DPRINTF("########### AUDIO WRITE! %d / %d - %d\n", s->ppos, s->bpos, n);
+             len = AUD_write(s->voice, &s->buf[s->ppos], n);
+             s->ppos += len;
+-	    return;
++            return;
+         }
+     }
+     
+@@ -129,7 +155,9 @@ static void screamerspk_callback(void *opaque, int avail)
+         /* Deferred IRQ */
+         s->bpos = 0;
+         s->ppos = 0;
+-        pmac_transfer(&s->io);
++
++        SCREAMER_DPRINTF("Processing deferred buffer\n");
++        pmac_screamer_tx_transfer(&s->io);
+     }
+ }
+ 
+@@ -147,6 +175,19 @@ static void screamer_update_settings(ScreamerState *s)
+     AUD_set_active_out(s->voice, true);
+ }
+ 
++static void screamer_update_volume(ScreamerState *s)
++{
++    uint8_t muted = s->codec_ctrl_regs[0x1] & 0x80 ? 1 : 0;
++    uint8_t att_left = (s->codec_ctrl_regs[0x4] & 0xf);
++    uint8_t att_right = (s->codec_ctrl_regs[0x4] & 0x3c0) >> 6;
++
++    SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
++                     muted, att_left, att_right);
++
++    AUD_set_volume_out_lr(s->voice, muted, (0xf - att_left) << 4,
++                          (0xf - att_right) << 4);
++}
++
+ static void screamer_reset(DeviceState *dev)
+ {
+     ScreamerState *s = SCREAMER(dev);
+@@ -175,9 +216,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
+ static void screamer_control_write(ScreamerState *s, uint32_t val)
+ {
+     SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
+-    
+-    s->regs[0] = val;
+-    
++        
+     /* Basic rate selection */
+     switch ((val & 0x700) >> 8) {
+     case 0x00:
+@@ -208,45 +247,30 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
+ 
+     SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
+     screamer_update_settings(s);
++    
++    s->regs[0] = val;
+ }
+ 
+-static void screamer_codec_write(ScreamerState *s, hwaddr addr,
+-                           uint64_t val)
++static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
+ {
+     SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
+ 
+-    s->codec_ctrl_regs[addr] = val;
+-    
+-    /* Extra rate selection */
+-    switch ((val & 0x38) >> 3) {
+-    case 0x0:
+-        s->rate = 48000;
+-        break;
++    switch (addr) {
+     case 0x1:
+-        s->rate = 32000;
+-        break;
+-    case 0x2:
+-        s->rate = 24000;
+-        break;
+-    case 0x3:
+-        s->rate = 19200;
++        /* Clear recalibrate if set */
++        val = val & ~CODEC_CTRL1_RECALIBRATE;    
++
++        /* Update volume in case mute set */
++        screamer_update_volume(s);
+         break;
++
+     case 0x4:
+-        s->rate = 16000;
+-        break;
+-    case 0x5:
+-        s->rate = 12000;
+-        break;
+-    case 0x6:
+-        s->rate = 9600;
+-        break;
+-    case 0x7:
+-        s->rate = 8000;
++        /* Speaker attenuation */
++        screamer_update_volume(s);
+         break;
+     }
+     
+-    SCREAMER_DPRINTF("extra rate: %d\n", s->rate);
+-    screamer_update_settings(s);
++    s->codec_ctrl_regs[addr] = val;
+ }
+ 
+ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+@@ -263,10 +287,19 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+         val = s->regs[addr] & ~CODEC_CTRL_MASKECMD;
+         break;
+     case CODEC_STAT_REG:
+-        val = CODEC_STAT_MASK_VALID;
++        if (s->codec_ctrl_regs[7] & 1) {
++            /* Read back mode */
++            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0xe];
++        } else {
++            /* Return status register */
++            val = s->regs[addr] & ~0xff00;
++            val |= CODEC_STAT_MANUFACTURER_CRYSTAL | CODEC_STAT_AWACS_REVISION |
++                   CODEC_STAT_MASK_VALID;
++        }
+         break;
+     case CLIP_CNT_REG:
+     case BYTE_SWAP_REG:
++    case FRAME_CNT_REG:
+         val = s->regs[addr];
+         break;
+     default:
+@@ -337,6 +370,7 @@ static void screamer_initfn(Object *obj)
+     sysbus_init_mmio(d, &s->mem);
+     sysbus_init_irq(d, &s->irq);
+     sysbus_init_irq(d, &s->dma_tx_irq);
++    sysbus_init_irq(d, &s->dma_rx_irq);
+ }
+ 
+ static const Property screamer_properties[] = {
+diff --git a/hw/misc/macio/macio.c b/hw/misc/macio/macio.c
+index 0c3e8d793..c59b834f5 100644
+--- a/hw/misc/macio/macio.c
++++ b/hw/misc/macio/macio.c
+@@ -202,7 +202,8 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
+     sbd = SYS_BUS_DEVICE(&s->screamer);
+     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_IRQ));
+     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_TX_DMA_IRQ));
+-    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10);
++    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_SCREAMER_RX_IRQ));
++    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
+ }
+ 
+ static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
+@@ -361,7 +362,8 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
+     sbd = SYS_BUS_DEVICE(&s->screamer);
+     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_IRQ));
+     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_DMA_IRQ));
+-    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10);
++    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, NEWWORLD_SCREAMER_RX_IRQ));
++    macio_screamer_register_dma(SCREAMER(sbd), &s->dbdma, 0x10, 0x12);
+ }
+ 
+ static void macio_newworld_init(Object *obj)
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+index 9a2a0fe93..834b4ae22 100644
+--- a/include/hw/audio/screamer.h
++++ b/include/hw/audio/screamer.h
+@@ -44,6 +44,7 @@ struct ScreamerState {
+     qemu_irq irq;
+     void *dbdma;
+     qemu_irq dma_tx_irq;
++    qemu_irq dma_rx_irq;
+ 
+     AudioBackend *be;
+     SWVoiceOut *voice;
+@@ -54,9 +55,9 @@ struct ScreamerState {
+     DBDMA_io io;
+ 
+     uint32_t regs[6];
+-    uint32_t codec_ctrl_regs[7];
++    uint32_t codec_ctrl_regs[8];
+ };
+ 
+-void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel);
++void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel);
+ 
+ #endif
+diff --git a/include/hw/misc/macio/macio.h b/include/hw/misc/macio/macio.h
+index 3503e6679..c806fb5f6 100644
+--- a/include/hw/misc/macio/macio.h
++++ b/include/hw/misc/macio/macio.h
+@@ -49,6 +49,7 @@
+ #define OLDWORLD_IDE1_DMA_IRQ  0x3
+ #define OLDWORLD_SCREAMER_TX_IRQ  0x11
+ #define OLDWORLD_SCREAMER_TX_DMA_IRQ 0x08
++#define OLDWORLD_SCREAMER_RX_IRQ  0x09
+ 
+ /* New World IRQs */
+ #define NEWWORLD_CUDA_IRQ      0x19
+@@ -63,6 +64,7 @@
+ #define NEWWORLD_EXTING_GPIO9  0x37
+ #define NEWWORLD_SCREAMER_IRQ  0x18
+ #define NEWWORLD_SCREAMER_DMA_IRQ 0x09
++#define NEWWORLD_SCREAMER_RX_IRQ 0x0a
+ 
+ /* MacIO virtual bus */
+ #define TYPE_MACIO_BUS "macio-bus"
+@@ -146,6 +148,7 @@ struct NewWorldMacIOState {
+     bool has_pmu;
+     bool has_adb;
+     OpenPICState pic;
++
+     MACIOIDEState ide[2];
+     MacIOGPIOState gpio;
+ };

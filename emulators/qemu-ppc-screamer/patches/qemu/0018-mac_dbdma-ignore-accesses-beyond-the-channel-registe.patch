@@ -1,0 +1,45 @@
+From f2353a4c22c457a07ddfec47f0de5ec4417aa7f4 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Tue, 24 Nov 2026 23:50:24 +0100
+Subject: [PATCH 18/19] mac_dbdma: ignore accesses beyond the channel registers
+
+The channel stride is 0x80 bytes, the register file has 16 entries. The
+handlers indexed regs[] with the raw offset, so reserved offsets reached the
+fields behind it. Upstream master already limits the index.
+---
+ hw/misc/macio/mac_dbdma.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/hw/misc/macio/mac_dbdma.c b/hw/misc/macio/mac_dbdma.c
+index 7833edb9c..ed2499e0c 100644
+--- a/hw/misc/macio/mac_dbdma.c
++++ b/hw/misc/macio/mac_dbdma.c
+@@ -698,6 +698,12 @@ static void dbdma_write(void *opaque, hwaddr addr,
+     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
+                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
+ 
++    if (reg >= DBDMA_REGS) {
++        qemu_log_mask(LOG_GUEST_ERROR, "dbdma: write to reserved register "
++                      "0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++
+     /* Settle the paced channel before changing its control or conditions. */
+     if (ch->clock) {
+         ch->clock(ch->io.opaque);
+@@ -759,6 +765,12 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
+     DBDMA_channel *ch = &s->channels[channel];
+     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
+ 
++    if (reg >= DBDMA_REGS) {
++        qemu_log_mask(LOG_GUEST_ERROR, "dbdma: read of reserved register "
++                      "0x%" HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++
+     value = ch->regs[reg];
+ 
+     switch(reg) {
+-- 
+2.43.0
+

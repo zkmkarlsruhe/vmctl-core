@@ -54,8 +54,10 @@ def _populate_default_registry() -> None:
     # modules, which import contract/capabilities.
     from .modules import (
         LinuxModule,
+        MacOS7Module,
         MacOS9Module,
         MacOSXModule,
+        MacOSXTigerModule,
         Windows7Module,
         Windows2003Module,
         WindowsModernModule,
@@ -68,8 +70,10 @@ def _populate_default_registry() -> None:
         Windows7Module,
         WindowsModernModule,
         LinuxModule,
+        MacOS7Module,
         MacOS9Module,
         MacOSXModule,
+        MacOSXTigerModule,
     ):
         default_registry.register(cls())
     default_registry.set_fallback(WindowsModernModule())

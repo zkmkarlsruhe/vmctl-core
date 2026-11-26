@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+Date: Sat, 12 Nov 2016 16:39:17 +0000
+Subject: [PATCH 01/16] audio: add dummy screamer device
+
+Signed-off-by: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+---
+ hw/audio/Kconfig            |   6 +++
+ hw/audio/meson.build        |   1 +
+ hw/audio/screamer.c         | 103 ++++++++++++++++++++++++++++++++++++
+ hw/ppc/Kconfig              |   2 +
+ include/hw/audio/screamer.h |  43 +++++++++++++++
+ 5 files changed, 155 insertions(+)
+ create mode 100644 hw/audio/screamer.c
+ create mode 100644 include/hw/audio/screamer.h
+
+diff --git a/hw/audio/Kconfig b/hw/audio/Kconfig
+index daf060e1b..a940493ec 100644
+--- a/hw/audio/Kconfig
++++ b/hw/audio/Kconfig
+@@ -55,3 +55,9 @@ config VIRTIO_SND
+     bool
+     default y
+     depends on VIRTIO
++
++config MARVELL_88W8618
++    bool
++
++config SCREAMER
++    bool
+diff --git a/hw/audio/meson.build b/hw/audio/meson.build
+index 2154cbdb5..39314d50a 100644
+--- a/hw/audio/meson.build
++++ b/hw/audio/meson.build
+@@ -11,6 +11,7 @@ system_ss.add(when: 'CONFIG_MARVELL_88W8618', if_true: files('marvell_88w8618.c'
+ system_ss.add(when: 'CONFIG_PCSPK', if_true: files('pcspk.c'))
+ system_ss.add(when: 'CONFIG_PL041', if_true: files('pl041.c', 'lm4549.c'))
+ system_ss.add(when: 'CONFIG_SB16', if_true: files('sb16.c'))
++system_ss.add(when: 'CONFIG_SCREAMER', if_true: files('screamer.c'))
+ system_ss.add(when: 'CONFIG_VT82C686', if_true: files('via-ac97.c'))
+ system_ss.add(when: 'CONFIG_WM8750', if_true: files('wm8750.c'))
+ system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO'], if_true: files('virtio-snd.c'))
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+new file mode 100644
+index 000000000..5d656b8e8
+--- /dev/null
++++ b/hw/audio/screamer.c
+@@ -0,0 +1,103 @@
++/*
++ * QEMU PowerMac Awacs Screamer device support
++ *
++ * Copyright (c) 2016 Mark Cave-Ayland
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/hw.h"
++#include "hw/audio/screamer.h"
++#include "hw/qdev-properties.h"
++#include "qemu/timer.h"
++#include "system/system.h"
++#include "qemu/cutils.h"
++#include "qemu/log.h"
++
++/* debug screamer */
++//#define DEBUG_SCREAMER
++
++#ifdef DEBUG_SCREAMER
++#define SCREAMER_DPRINTF(fmt, ...)                                  \
++    do { printf("SCREAMER: " fmt , ## __VA_ARGS__); } while (0)
++#else
++#define SCREAMER_DPRINTF(fmt, ...)
++#endif
++
++
++static void screamer_reset(DeviceState *dev)
++{
++    return;
++}
++
++static void screamer_realizefn(DeviceState *dev, Error **errp)
++{
++    return;
++}
++
++static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return 0;
++}
++
++static void screamer_write(void *opaque, hwaddr addr,
++                           uint64_t val, unsigned size)
++{
++    return;
++}
++
++static const MemoryRegionOps screamer_ops = {
++    .read = screamer_read,
++    .write = screamer_write,
++    .endianness = DEVICE_BIG_ENDIAN
++};
++
++static void screamer_initfn(Object *obj)
++{
++    SysBusDevice *d = SYS_BUS_DEVICE(obj);
++    ScreamerState *s = SCREAMER(obj);
++
++    memory_region_init_io(&s->mem, obj, &screamer_ops, s, "screamer", 0x2000);
++    sysbus_init_mmio(d, &s->mem);
++    sysbus_init_irq(d, &s->irq);
++}
++
++static void screamer_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = screamer_realizefn;
++    dc->legacy_reset = screamer_reset;
++}
++
++static const TypeInfo screamer_type_info = {
++    .name = TYPE_SCREAMER,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ScreamerState),
++    .instance_init = screamer_initfn,
++    .class_init = screamer_class_init,
++};
++
++static void screamer_register_types(void)
++{
++    type_register_static(&screamer_type_info);
++}
++
++type_init(screamer_register_types)
+diff --git a/hw/ppc/Kconfig b/hw/ppc/Kconfig
+index 347dcce69..5ec4ac0d8 100644
+--- a/hw/ppc/Kconfig
++++ b/hw/ppc/Kconfig
+@@ -132,6 +132,7 @@ config MAC_OLDWORLD
+     select HEATHROW_PIC
+     select MACIO
+     select FW_CFG_PPC
++    select SCREAMER
+ 
+ config MAC_NEWWORLD
+     bool
+@@ -147,6 +148,7 @@ config MAC_NEWWORLD
+     select MAC_PMU
+     select UNIN_PCI
+     select FW_CFG_PPC
++    select SCREAMER
+ 
+ config E500
+     bool
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+new file mode 100644
+index 000000000..c6438df5c
+--- /dev/null
++++ b/include/hw/audio/screamer.h
+@@ -0,0 +1,43 @@
++/*
++ * QEMU PowerMac Awacs Screamer device support
++ *
++ * Copyright (c) 2016 Mark Cave-Ayland
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++
++#ifndef HW_AUDIO_SCREAMER_H
++#define HW_AUDIO_SCREAMER_H
++
++#include "qemu/osdep.h"
++#include "hw/sysbus.h"
++
++#define TYPE_SCREAMER "screamer"
++OBJECT_DECLARE_SIMPLE_TYPE(ScreamerState, SCREAMER)
++
++struct ScreamerState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mem;
++    qemu_irq irq;
++};
++
++#endif

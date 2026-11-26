@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Sun, 1 Nov 2026 16:56:29 +0100
+Subject: [PATCH 12/16] screamer: port to QEMU 11.1
+
+The audio voice calls became audio_be_* with an explicit backend
+argument, and the hw/irq.h, hw/qdev-properties.h and hw/sysbus.h
+headers moved to hw/core/ (hw/hw.h is gone). Drop the stale
+MARVELL_88W8618 Kconfig entry the rebase carried over; it lives in
+hw/arm/Kconfig now.
+---
+ hw/audio/Kconfig            |  3 ---
+ hw/audio/screamer.c         | 17 ++++++++---------
+ include/hw/audio/screamer.h |  2 +-
+ 3 files changed, 9 insertions(+), 13 deletions(-)
+
+diff --git a/hw/audio/Kconfig b/hw/audio/Kconfig
+index a940493ec..878b7fccb 100644
+--- a/hw/audio/Kconfig
++++ b/hw/audio/Kconfig
+@@ -56,8 +56,5 @@ config VIRTIO_SND
+     default y
+     depends on VIRTIO
+ 
+-config MARVELL_88W8618
+-    bool
+-
+ config SCREAMER
+     bool
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index 98a216033..bd1463d36 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -23,11 +23,10 @@
+  */
+ 
+ #include "qemu/osdep.h"
+-#include "hw/hw.h"
+ #include "qemu/audio.h"
+-#include "hw/irq.h"
++#include "hw/core/irq.h"
+ #include "hw/audio/screamer.h"
+-#include "hw/qdev-properties.h"
++#include "hw/core/qdev-properties.h"
+ #include "qemu/timer.h"
+ #include "hw/ppc/mac_dbdma.h"
+ #include "system/system.h"
+@@ -197,7 +196,7 @@ static void screamerspk_callback(void *opaque, int free_b)
+     samples = MIN(s->samples, free_b >> s->shift);
+     generated = MIN(samples, s->wpos - s->rpos);
+ 
+-    AUD_write(s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
++    audio_be_write(s->be, s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
+               generated << s->shift);
+ 
+     SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
+@@ -236,17 +235,17 @@ static void screamer_update_settings(ScreamerState *s)
+     struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16,
+         1 };
+ 
+-    s->voice = AUD_open_out(s->be, s->voice, s_spk, s, screamerspk_callback, &as);
++    s->voice = audio_be_open_out(s->be, s->voice, s_spk, s, screamerspk_callback, &as);
+     if (!s->voice) {
+         error_report("Could not open voice");
+         exit(1);
+     }
+ 
+     s->shift = 2;
+-    s->samples = AUD_get_buffer_size_out(s->voice) >> s->shift;
++    s->samples = audio_be_get_buffer_size_out(s->be, s->voice) >> s->shift;
+     s->mixbuf = g_malloc0(s->samples << s->shift);
+ 
+-    AUD_set_active_out(s->voice, true);
++    audio_be_set_active_out(s->be, s->voice, true);
+ }
+ 
+ static void screamer_update_volume(ScreamerState *s)
+@@ -258,7 +257,7 @@ static void screamer_update_volume(ScreamerState *s)
+     SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
+                      muted, att_left, att_right);
+ 
+-    AUD_set_volume_out_lr(s->voice, muted, (0xf - att_left) << 4,
++    audio_be_set_volume_out_lr(s->be, s->voice, muted, (0xf - att_left) << 4,
+                           (0xf - att_right) << 4);
+ }
+ 
+@@ -283,7 +282,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
+ {
+     ScreamerState *s = SCREAMER(dev);
+ 
+-    if (!AUD_backend_check(&s->be, errp)) {
++    if (!audio_be_check(&s->be, errp)) {
+         return;
+     }
+ 
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+index 2975bfefd..5c71b0ab8 100644
+--- a/include/hw/audio/screamer.h
++++ b/include/hw/audio/screamer.h
+@@ -26,7 +26,7 @@
+ #define HW_AUDIO_SCREAMER_H
+ 
+ #include "qemu/osdep.h"
+-#include "hw/sysbus.h"
++#include "hw/core/sysbus.h"
+ #include "hw/ppc/mac_dbdma.h"
+ #include "qemu/audio.h"
+ 

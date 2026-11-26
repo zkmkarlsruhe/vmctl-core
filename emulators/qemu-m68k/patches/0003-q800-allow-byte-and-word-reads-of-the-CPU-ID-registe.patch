@@ -1,0 +1,55 @@
+From 795119b0277d8f3b88ca8b7606e1aa8cbb798d39 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Mon, 5 Oct 2026 16:15:41 +0200
+Subject: [PATCH] q800: allow byte and word reads of the CPU ID register
+
+The machine ID register at 0x5ffffffc only accepts 32-bit accesses.
+The Mac ROM with checksum FF7439EE (LC 475 / Quadra 605 / LC 575),
+whose machine table also contains the Quadra 800 entry (CPU ID
+0x2bad), reads the register with a 16-bit access late in its startup
+tests:
+
+    cmpi.w #0x2bad,0x5ffffffc
+
+QEMU raises an access fault for it, the ROM records a POST failure and
+ends up polling the SCC receive status with interrupts masked forever:
+grey screen, no chime.
+
+Accept 1 to 4 byte reads and return the addressed bytes of the
+big-endian register, as a 68040 partial read of a 32-bit register
+would see them (a word read at offset 0 returns 0xa55a, so the
+comparison above is false and the ROM carries on). Writes remain
+ignored.
+
+With this change that ROM boots System 7.5.3 to the Finder on the q800
+machine.
+---
+ hw/m68k/q800.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/hw/m68k/q800.c b/hw/m68k/q800.c
+index 5d0cb4d483..75c150e6b0 100644
+--- a/hw/m68k/q800.c
++++ b/hw/m68k/q800.c
+@@ -205,7 +205,8 @@ static const MemoryRegionOps macio_alias_ops = {
+ 
+ static uint64_t machine_id_read(void *opaque, hwaddr addr, unsigned size)
+ {
+-    return Q800_MACHINE_ID;
++    /* Big-endian register: offset 0 holds the most significant byte */
++    return extract32(Q800_MACHINE_ID, (4 - addr - size) * 8, size * 8);
+ }
+ 
+ static void machine_id_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -218,7 +219,7 @@ static const MemoryRegionOps machine_id_ops = {
+     .write = machine_id_write,
+     .endianness = DEVICE_BIG_ENDIAN,
+     .valid = {
+-        .min_access_size = 4,
++        .min_access_size = 1,
+         .max_access_size = 4,
+     },
+ };
+-- 
+2.43.0
+

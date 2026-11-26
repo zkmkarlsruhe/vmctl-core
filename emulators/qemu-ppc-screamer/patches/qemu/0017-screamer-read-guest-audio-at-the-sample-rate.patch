@@ -1,0 +1,1258 @@
+From d07a49bd0cc9783a46371887789c21e1ae457053 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Tue, 24 Nov 2026 23:50:24 +0100
+Subject: [PATCH 17/19] screamer: read guest audio at the sample rate
+
+The device copied its whole host buffer (2049 frames) from guest memory in
+one burst. Mac OS X keeps a safety margin of 45 frames, so the copy ran ahead
+of what CoreAudio had written and silence was played: 25 % of the audible
+time of a work was lost, with gaps on a 2049 frame grid.
+
+Pace the TX channel with the virtual clock, at most 1 ms per step, and buffer
+on the host side behind the read. Descriptor completion, interrupts and the
+frame counter now share one timeline; the frame counter is writable.
+---
+ hw/audio/screamer.c         | 339 ++++++++++++++++++------------------
+ hw/misc/macio/mac_dbdma.c   | 200 ++++++++++++---------
+ include/hw/audio/screamer.h |  24 ++-
+ include/hw/ppc/mac_dbdma.h  |  16 +-
+ tests/qtest/meson.build     |   1 +
+ tests/qtest/screamer-test.c | 313 +++++++++++++++++++++++++++++++++
+ 6 files changed, 626 insertions(+), 267 deletions(-)
+ create mode 100644 tests/qtest/screamer-test.c
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index 2eac01131..4be501cc7 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -35,6 +35,7 @@
+ #include "qemu/typedefs.h"
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
++#include "migration/vmstate.h"
+ 
+ /* debug screamer */
+ //#define DEBUG_SCREAMER
+@@ -64,84 +65,121 @@
+ /* Audio */
+ static const char *s_spk = "screamer";
+ 
+-static void pmac_screamer_tx_transfer(ScreamerState *s)
+-{
+-    DBDMA_io *io = &s->io;
+-    int samples;
+-
+-    samples = MIN(io->len >> s->shift, s->samples - s->wpos);
+-    if (samples > 0) {
+-        dma_memory_read(&address_space_memory, io->addr,
+-                        &s->mixbuf[s->wpos << s->shift], samples << s->shift,
+-                        MEMTXATTRS_UNSPECIFIED);
+-
+-        SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
++#define FRAME_BYTES 4            /* big-endian s16 stereo */
++#define TICK_NS (SCALE_MS / 2)
++#define PREBUFFER_MS 20
++#define MAX_RATE 44100
++/* One millisecond at the fastest trimmed rate, rounded up. */
++#define MAX_FRAMES DIV_ROUND_UP(MAX_RATE + MAX_RATE / 200, 1000)
+ 
+-        io->addr += (samples << s->shift);
+-        io->len -= (samples << s->shift);
+-        s->wpos += samples;
+-    }
++static int screamer_transfer(ScreamerState *s, int due)
++{
++    DBDMA_channel *ch = s->tx;
++    DBDMA_io *io = &ch->io;
++    MemReentrancyGuard *audio = &DEVICE(s)->mem_reentrancy_guard;
++    MemReentrancyGuard *dma =
++        &DEVICE(dbdma_from_ch(s->tx))->mem_reentrancy_guard;
++    bool was_audio = audio->engaged_in_io;
++    bool was_dma = dma->engaged_in_io;
++    uint8_t buf[MAX_FRAMES * FRAME_BYTES];
++
++    /* Descriptor and PCM addresses may point back into either device. */
++    audio->engaged_in_io = dma->engaged_in_io = true;
++    /* Empty, sub-frame and non-stream commands also spend a descriptor slot. */
++    for (int i = 0; i < 64 && DBDMA_channel_running(ch); i++) {
++        int frames, bytes;
++
++        if (!io->processing) {
++            DBDMA_run_channel(ch);
++            if (!io->processing) {
++                continue;
++            }
++        }
+ 
+-    /* A trailing partial frame can never be transferred: drop it */
+-    if (io->len && (io->len >> s->shift) == 0) {
+-        io->addr += io->len;
++        frames = MIN(due, io->len / FRAME_BYTES);
++        bytes = frames * FRAME_BYTES;
++
++        if (bytes) {
++            int space = fifo8_num_free(&s->fifo);
++
++            dma_memory_read(&address_space_memory, io->addr, buf, bytes,
++                            MEMTXATTRS_UNSPECIFIED);
++            if (bytes > space) {
++                /* Keep the guest clock running if the host stops consuming. */
++                fifo8_drop(&s->fifo, bytes - space);
++            }
++            fifo8_push_all(&s->fifo, buf, bytes);
++            io->addr += bytes;
++            io->len -= bytes;
++            s->regs[FRAME_CNT_REG] += frames;
++            due -= frames;
++        }
++        if (io->len >= FRAME_BYTES) {
++            break;
++        }
++        /* A trailing partial frame can never be transferred: drop it */
+         io->len = 0;
+-    }
+-
+-    /* Continue DBDMA if we have completed the transfer, otherwise defer */
+-    if (io->len == 0) {
+-        SCREAMER_DPRINTF("-> End of transfer\n");
+         io->dma_end(io);
+     }
++    audio->engaged_in_io = was_audio;
++    dma->engaged_in_io = was_dma;
++    return due;
+ }
+ 
+-static void pmac_screamer_tx(DBDMA_io *io)
+-{
+-    ScreamerState *s = io->opaque;
+-
+-    SCREAMER_DPRINTF("DMA TX transfer: addr %" HWADDR_PRIx
+-                     " len: %x\n", io->addr, io->len);
+-
+-    memcpy(&s->io, io, sizeof(DBDMA_io));
+-    //if (s->wpos + (s->io.len >> s->shift) > s->samples) {
+-    //    return;
+-    //}
+-
+-    pmac_screamer_tx_transfer(s);
+-}
+-
+-static void pmac_screamer_tx_flush(DBDMA_io *io)
++static void screamer_clock(void *opaque)
+ {
+-    DBDMA_channel *ch = io->channel;
+-    dbdma_cmd *current = &ch->current;
+-    uint16_t cmd;
+-
+-    SCREAMER_DPRINTF("DMA TX flush!\n");
+-#if 0
+-    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
+-    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
+-        cmd == INPUT_MORE || cmd == INPUT_LAST) {
+-        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-        current->res_count = cpu_to_le16(io->len);
++    ScreamerState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    int prebuffer = s->rate * PREBUFFER_MS / 1000;
++    int queued, unread = 0;
+ 
+-        dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+-                         &ch->current, sizeof(dbdma_cmd),
+-                         MEMTXATTRS_UNSPECIFIED);
++    if (!s->tx) {
++        return;
+     }
+-#endif
+-
+-    ch->io.processing = false;
+-
+-    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
+-    if (cmd == INPUT_MORE || cmd == INPUT_LAST) {
+-        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-        current->res_count = cpu_to_le16(io->len);
+-
+-            dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+-                         &ch->current, sizeof(dbdma_cmd),
+-                         MEMTXATTRS_UNSPECIFIED);
++    if (DBDMA_channel_running(s->tx)) {
++        int64_t elapsed = s->last_ns < 0 ? 0 : now - s->last_ns;
++        int rate = s->rate + s->trim;
++        int64_t step;
++        int due;
++
++        /* Repay stalls at up to twice virtual time, at most 1 ms per call. */
++        s->lag_ns += elapsed;
++        step = MIN(s->lag_ns, 2 * MIN(elapsed, TICK_NS));
++        s->lag_ns -= step;
++        s->last_ns = now;
++        s->fraction += step * rate;
++        due = s->fraction / NANOSECONDS_PER_SECOND;
++        s->fraction %= NANOSECONDS_PER_SECOND;
++
++        unread = screamer_transfer(s, due);
++        if (unread) {
++            /* Carry time unused by a long chain of non-audio commands. */
++            s->fraction += (int64_t)unread * NANOSECONDS_PER_SECOND;
++            s->lag_ns += s->fraction / rate;
++            s->fraction %= rate;
++        }
+     }
+ 
++    queued = fifo8_num_used(&s->fifo) / FRAME_BYTES;
++    if (DBDMA_channel_running(s->tx)) {
++        if (!timer_pending(&s->timer)) {
++            timer_mod(&s->timer, now + TICK_NS);
++        }
++        if ((queued >= prebuffer || (unread && queued)) &&
++            !audio_be_is_active_out(s->be, s->voice)) {
++            audio_be_set_active_out(s->be, s->voice, true);
++        }
++    } else {
++        timer_del(&s->timer);
++        s->last_ns = -1;
++        s->lag_ns = 0;
++        s->trim = 0;
++        if (!(s->tx->regs[DBDMA_STATUS] & PAUSE)) {
++            s->fraction = 0;
++        }
++        /* Release even a single frame at the end of a short sound. */
++        audio_be_set_active_out(s->be, s->voice, queued != 0);
++    }
+ }
+ 
+ static void pmac_screamer_rx(DBDMA_io *io)
+@@ -180,9 +218,9 @@ static void pmac_screamer_rx_flush(DBDMA_io *io)
+ 
+ void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, int rxchannel)
+ {
+-    s->dbdma = dbdma;
+-    DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
+-                           pmac_screamer_tx, pmac_screamer_tx_flush, s);
++    s->tx = DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
++                                   NULL, NULL, s);
++    s->tx->clock = screamer_clock;
+     DBDMA_register_channel(dbdma, rxchannel, s->dma_rx_irq,
+                            pmac_screamer_rx, pmac_screamer_rx_flush, s);
+ }
+@@ -190,55 +228,31 @@ void macio_screamer_register_dma(ScreamerState *s, void *dbdma, int txchannel, i
+ static void screamerspk_callback(void *opaque, int free_b)
+ {
+     ScreamerState *s = opaque;
+-    DBDMA_io *io = &s->io;
+-    int samples, generated;
++    uint32_t left = MIN(free_b / FRAME_BYTES * FRAME_BYTES,
++                        fifo8_num_used(&s->fifo));
+ 
+-    if (free_b == 0) {
+-        return;
+-    }
+-
+-    if (s->rpos < s->wpos) {
+-        samples = MIN(s->samples, free_b >> s->shift);
+-        generated = MIN(samples, s->wpos - s->rpos);
++    while (left) {
++        uint32_t size;
++        const uint8_t *buf = fifo8_peek_bufptr(&s->fifo, left, &size);
++        size_t written = audio_be_write(s->be, s->voice, (void *)buf, size);
+ 
+-        audio_be_write(s->be, s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
+-                       generated << s->shift);
+-
+-        SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
+-
+-        s->regs[FRAME_CNT_REG] += generated;
+-        s->rpos += generated;
+-        if (s->rpos < s->wpos) {
+-            return;
++        fifo8_drop(&s->fifo, written);
++        if (written < size) {
++            break;
+         }
++        left -= written;
+     }
+-
+-    /*
+-     * Buffer drained. Resume a deferred transfer even if nothing was buffered:
+-     * after a rate change the buffer is empty while the DMA still waits.
+-     */
+-
+-    s->wpos = 0;
+-    s->rpos = 0;
+-
+-    /* only while the guest keeps the channel running (a stopped one is not resumed) */
+-    if (io->len && (((DBDMA_channel *)io->channel)->regs[DBDMA_STATUS] & RUN)) {
+-        DBDMA_channel *ch = io->channel;
+-        uint32_t status = ch->regs[DBDMA_STATUS];
+-
+-        SCREAMER_DPRINTF("Continue deferred transfer\n");
+-
+-        /* Disable channel so we only complete the current transfer */
+-        ch->regs[DBDMA_STATUS] &= ~RUN;
+-
+-        /* Perform deferred transfer */
+-        pmac_screamer_tx_transfer(s);
+-
+-        /* Re-enable channel */
+-        ch->regs[DBDMA_STATUS] = status;
+-
+-        /* Kick channel to continue */
+-        DBDMA_kick(container_of(ch, DBDMAState, channels[ch->channel]));
++    if (timer_pending(&s->timer)) {
++        /*
++         * Measure after the pull to exclude the host callback period.
++         * A target-sized error trims the device clock by 0.5%.
++         */
++        int target = s->rate * PREBUFFER_MS / 2000;
++        int error = target - (int)fifo8_num_used(&s->fifo) / FRAME_BYTES;
++
++        s->trim = CLAMP(error, -target, target) * s->rate / (200 * target);
++    } else if (fifo8_is_empty(&s->fifo)) {
++        audio_be_set_active_out(s->be, s->voice, false);
+     }
+ }
+ 
+@@ -253,15 +267,8 @@ static void screamer_update_settings(ScreamerState *s)
+         exit(1);
+     }
+ 
+-    /* the buffer size follows the rate: start over with an empty one */
+-    s->shift = 2;
+-    s->samples = audio_be_get_buffer_size_out(s->be, s->voice) >> s->shift;
+-    g_free(s->mixbuf);
+-    s->mixbuf = g_malloc0(s->samples << s->shift);
+-    s->wpos = 0;
+-    s->rpos = 0;
+-
+-    audio_be_set_active_out(s->be, s->voice, true);
++    s->trim = 0;
++    audio_be_set_active_out(s->be, s->voice, !fifo8_is_empty(&s->fifo));
+ }
+ 
+ static void screamer_update_volume(ScreamerState *s)
+@@ -283,15 +290,13 @@ static void screamer_reset(DeviceState *dev)
+     
+     memset(s->regs, 0, sizeof(s->regs));
+     memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
+-    memset(&s->io, 0, sizeof(DBDMA_io));
+-
+-    s->rate = 44100;
++    timer_del(&s->timer);
++    s->last_ns = -1;
++    s->lag_ns = 0;
++    s->fraction = 0;
++    fifo8_reset(&s->fifo);
++    s->rate = MAX_RATE;
+     screamer_update_settings(s);
+-
+-    s->bpos = 0;
+-    s->ppos = 0;
+-
+-    return;
+ }
+ 
+ static void screamer_realizefn(DeviceState *dev, Error **errp)
+@@ -302,47 +307,35 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
+         return;
+     }
+ 
+-    s->rate = 44100;
++    fifo8_create(&s->fifo, 8192 * FRAME_BYTES);
++    timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, screamer_clock, s);
++    s->last_ns = -1;
++    s->rate = MAX_RATE;
+     screamer_update_settings(s);
+ }
+ 
+-static void screamer_control_write(ScreamerState *s, uint32_t val)
++static void screamer_unrealize(DeviceState *dev)
+ {
+-    uint32_t old_rate = s->rate;
++    ScreamerState *s = SCREAMER(dev);
+ 
+-    SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
+-        
+-    /* Basic rate selection */
+-    switch ((val & 0x700) >> 8) {
+-    case 0x00:
+-        s->rate = 44100;
+-        break;
+-    case 0x1:
+-        s->rate = 29400;
+-        break;
+-    case 0x2:
+-        s->rate = 22050;
+-        break;
+-    case 0x3:
+-        s->rate = 17640;
+-        break;
+-    case 0x4:
+-        s->rate = 14700;
+-        break;
+-    case 0x5:
+-        s->rate = 11025;
+-        break;
+-    case 0x6:
+-        s->rate = 8820;
+-        break;
+-    case 0x7:
+-        s->rate = 7350;
+-        break;
+-    }
++    timer_del(&s->timer);
++    timer_deinit(&s->timer);
++    audio_be_close_out(s->be, s->voice);
++    fifo8_destroy(&s->fifo);
++}
+ 
+-    SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
++static void screamer_control_write(ScreamerState *s, uint32_t val)
++{
++    static const int rates[] = {
++        MAX_RATE, 29400, 22050, 17640, 14700, 11025, 8820, 7350
++    };
++    int rate = rates[(val >> 8) & 7];
++
++    SCREAMER_DPRINTF("basic rate: %d\n", rate);
+     /* every control write used to reopen the voice and drop the buffered audio */
+-    if (s->rate != old_rate) {
++    if (s->rate != rate) {
++        screamer_clock(s);
++        s->rate = rate;
+         screamer_update_settings(s);
+     }
+     
+@@ -397,7 +390,10 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+         break;
+     case CLIP_CNT_REG:
+     case BYTE_SWAP_REG:
++        val = s->regs[addr];
++        break;
+     case FRAME_CNT_REG:
++        screamer_clock(s);
+         val = s->regs[addr];
+         break;
+     default:
+@@ -438,6 +434,10 @@ static void screamer_write(void *opaque, hwaddr addr,
+     case BYTE_SWAP_REG:
+         s->regs[addr] = val & 0xffffffff;
+         break;
++    case FRAME_CNT_REG:
++        screamer_clock(s);
++        s->regs[addr] = val & 0xffffffff;
++        break;
+     default:
+         qemu_log_mask(LOG_UNIMP,
+                   "screamer: Unimplemented register write "
+@@ -475,12 +475,19 @@ static const Property screamer_properties[] = {
+     DEFINE_AUDIO_PROPERTIES(ScreamerState, be),
+ };
+ 
++static const VMStateDescription vmstate_screamer = {
++    .name = TYPE_SCREAMER,
++    .unmigratable = 1,
++};
++
+ static void screamer_class_init(ObjectClass *oc, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(oc);
+ 
+     dc->realize = screamer_realizefn;
+-    dc->legacy_reset = screamer_reset;
++    dc->unrealize = screamer_unrealize;
++    device_class_set_legacy_reset(dc, screamer_reset);
++    dc->vmsd = &vmstate_screamer;
+     device_class_set_props(dc, screamer_properties);
+ }
+ 
+diff --git a/hw/misc/macio/mac_dbdma.c b/hw/misc/macio/mac_dbdma.c
+index a55c9c998..7833edb9c 100644
+--- a/hw/misc/macio/mac_dbdma.c
++++ b/hw/misc/macio/mac_dbdma.c
+@@ -67,11 +67,6 @@
+ /*
+  */
+ 
+-static DBDMAState *dbdma_from_ch(DBDMA_channel *ch)
+-{
+-    return container_of(ch, DBDMAState, channels[ch->channel]);
+-}
+-
+ #if DEBUG_DBDMA
+ static void dump_dbdma_cmd(DBDMA_channel *ch, dbdma_cmd *cmd)
+ {
+@@ -140,8 +135,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
+ 
+     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
+ 
+-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & 0x0f;
+-    sel_value = ch->regs[DBDMA_INTR_SEL] & 0x0f;
++    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & DEVSTAT;
++    sel_value = ch->regs[DBDMA_INTR_SEL] & DEVSTAT;
+ 
+     cond = (status & sel_mask) == (sel_value & sel_mask);
+ 
+@@ -181,8 +176,8 @@ static int conditional_wait(DBDMA_channel *ch)
+ 
+     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
+ 
+-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & 0x0f;
+-    sel_value = ch->regs[DBDMA_WAIT_SEL] & 0x0f;
++    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & DEVSTAT;
++    sel_value = ch->regs[DBDMA_WAIT_SEL] & DEVSTAT;
+ 
+     cond = (status & sel_mask) == (sel_value & sel_mask);
+ 
+@@ -247,8 +242,8 @@ static void conditional_branch(DBDMA_channel *ch)
+ 
+     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
+ 
+-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & 0x0f;
+-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & 0x0f;
++    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & DEVSTAT;
++    sel_value = ch->regs[DBDMA_BRANCH_SEL] & DEVSTAT;
+ 
+     cond = (status & sel_mask) == (sel_value & sel_mask);
+ 
+@@ -274,34 +269,58 @@ static void conditional_branch(DBDMA_channel *ch)
+     }
+ }
+ 
+-static void channel_run(DBDMA_channel *ch);
++bool DBDMA_channel_running(DBDMA_channel *ch)
++{
++    return (ch->regs[DBDMA_STATUS] & (RUN | ACTIVE)) == (RUN | ACTIVE) &&
++           !(ch->waiting && conditional_wait(ch));
++}
+ 
+-static void dbdma_end(DBDMA_io *io)
++static void dbdma_save_status(DBDMA_channel *ch)
+ {
+-    DBDMA_channel *ch = io->channel;
+     dbdma_cmd *current = &ch->current;
+ 
+-    DBDMA_DPRINTFCH(ch, "%s\n", __func__);
+-
+-    if (conditional_wait(ch))
+-        goto wait;
+-
+     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-    current->res_count = cpu_to_le16(io->len);
++    if ((le16_to_cpu(current->command) & COMMAND_MASK) <= INPUT_LAST) {
++        current->res_count = cpu_to_le16(ch->io.len);
++    }
+     dbdma_cmdptr_save(ch);
+-    if (io->is_last)
+-        ch->regs[DBDMA_STATUS] &= ~FLUSH;
++}
++
++static void dbdma_cmd_done(DBDMA_channel *ch)
++{
++    dbdma_cmd *current = &ch->current;
++    uint16_t cmd = le16_to_cpu(current->command) & COMMAND_MASK;
+ 
++    ch->waiting = conditional_wait(ch);
++    if (ch->waiting) {
++        return;
++    }
++
++    dbdma_save_status(ch);
++    if (cmd == LOAD_WORD || cmd == STORE_WORD ||
++        cmd == OUTPUT_LAST || cmd == INPUT_LAST) {
++        ch->regs[DBDMA_STATUS] &= ~FLUSH;
++    }
+     conditional_interrupt(ch);
+-    conditional_branch(ch);
++    if (cmd == LOAD_WORD || cmd == STORE_WORD) {
++        next(ch);
++    } else {
++        conditional_branch(ch);
++    }
+ 
+-wait:
+-    /* Indicate that we're ready for a new DMA round */
+-    ch->io.processing = false;
++    if (!ch->clock && DBDMA_channel_running(ch)) {
++        DBDMA_kick(dbdma_from_ch(ch));
++    }
++}
+ 
+-    if ((ch->regs[DBDMA_STATUS] & RUN) &&
+-        (ch->regs[DBDMA_STATUS] & ACTIVE))
+-        channel_run(ch);
++static void dbdma_end(DBDMA_io *io)
++{
++    DBDMA_channel *ch = io->channel;
++
++    if (io->processing) {
++        io->processing = false;
++        dbdma_cmd_done(ch);
++    }
+ }
+ 
+ static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
+@@ -374,18 +393,7 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
+     dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
+                     MEMTXATTRS_UNSPECIFIED);
+ 
+-    if (conditional_wait(ch))
+-        goto wait;
+-
+-    current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-    dbdma_cmdptr_save(ch);
+-    ch->regs[DBDMA_STATUS] &= ~FLUSH;
+-
+-    conditional_interrupt(ch);
+-    next(ch);
+-
+-wait:
+-    DBDMA_kick(dbdma_from_ch(ch));
++    dbdma_cmd_done(ch);
+ }
+ 
+ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
+@@ -407,35 +415,7 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
+     dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
+                      MEMTXATTRS_UNSPECIFIED);
+ 
+-    if (conditional_wait(ch))
+-        goto wait;
+-
+-    current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-    dbdma_cmdptr_save(ch);
+-    ch->regs[DBDMA_STATUS] &= ~FLUSH;
+-
+-    conditional_interrupt(ch);
+-    next(ch);
+-
+-wait:
+-    DBDMA_kick(dbdma_from_ch(ch));
+-}
+-
+-static void nop(DBDMA_channel *ch)
+-{
+-    dbdma_cmd *current = &ch->current;
+-
+-    if (conditional_wait(ch))
+-        goto wait;
+-
+-    current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+-    dbdma_cmdptr_save(ch);
+-
+-    conditional_interrupt(ch);
+-    conditional_branch(ch);
+-
+-wait:
+-    DBDMA_kick(dbdma_from_ch(ch));
++    dbdma_cmd_done(ch);
+ }
+ 
+ static void stop(DBDMA_channel *ch)
+@@ -445,7 +425,7 @@ static void stop(DBDMA_channel *ch)
+     /* the stop command does not increment command pointer */
+ }
+ 
+-static void channel_run(DBDMA_channel *ch)
++void DBDMA_run_channel(DBDMA_channel *ch)
+ {
+     dbdma_cmd *current = &ch->current;
+     uint16_t cmd, key;
+@@ -453,6 +433,10 @@ static void channel_run(DBDMA_channel *ch)
+     uint32_t phy_addr;
+ 
+     DBDMA_DPRINTFCH(ch, "channel_run\n");
++    if (ch->waiting) {
++        dbdma_cmd_done(ch);
++        return;
++    }
+     dump_dbdma_cmd(ch, current);
+ 
+     /* clear WAKE flag at command fetch */
+@@ -463,7 +447,7 @@ static void channel_run(DBDMA_channel *ch)
+ 
+     switch (cmd) {
+     case DBDMA_NOP:
+-        nop(ch);
++        dbdma_cmd_done(ch);
+         return;
+ 
+     case DBDMA_STOP:
+@@ -541,9 +525,8 @@ static void DBDMA_run(DBDMAState *s)
+ 
+     for (channel = 0; channel < DBDMA_CHANNELS; channel++) {
+         DBDMA_channel *ch = &s->channels[channel];
+-        uint32_t status = ch->regs[DBDMA_STATUS];
+-        if (!ch->io.processing && (status & RUN) && (status & ACTIVE)) {
+-            channel_run(ch);
++        if (!ch->clock && !ch->io.processing && DBDMA_channel_running(ch)) {
++            DBDMA_run_channel(ch);
+         }
+     }
+ }
+@@ -562,22 +545,20 @@ void DBDMA_kick(DBDMAState *dbdma)
+     qemu_bh_schedule(dbdma->bh);
+ }
+ 
+-void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
+-                            DBDMA_rw rw, DBDMA_flush flush,
+-                            void *opaque)
++DBDMA_channel *DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
++                                      DBDMA_rw rw, DBDMA_flush flush,
++                                      void *opaque)
+ {
+     DBDMAState *s = dbdma;
+     DBDMA_channel *ch = &s->channels[nchan];
+ 
+     DBDMA_DPRINTFCH(ch, "DBDMA_register_channel 0x%x\n", nchan);
+ 
+-    assert(rw);
+-    assert(flush);
+-
+     ch->irq = irq;
+     ch->rw = rw;
+     ch->flush = flush;
+     ch->io.opaque = opaque;
++    return ch;
+ }
+ 
+ static void dbdma_control_write(DBDMA_channel *ch)
+@@ -593,6 +574,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
+      * appropriately and store back
+      */
+     status = ch->regs[DBDMA_STATUS];
++    status = (status & ~(mask & DEVSTAT)) | (value & mask & DEVSTAT);
+ 
+     /* RUN and PAUSE are bits under SW control only
+      * FLUSH and WAKE are set by SW and cleared by HW
+@@ -683,7 +665,14 @@ static void dbdma_control_write(DBDMA_channel *ch)
+     /* If we need to flush the underlying HW, do it now, this happens
+      * both on FLUSH commands and when stopping the channel for safety.
+      */
+-    if (do_flush && ch->flush) {
++    if (ch->clock && (!(status & RUN) || (mask & value & FLUSH))) {
++        if (ch->io.processing || ch->waiting) {
++            dbdma_save_status(ch);
++            ch->io.processing = false;
++            ch->waiting = false;
++        }
++        status &= ~ACTIVE;
++    } else if (do_flush && ch->flush) {
+         ch->flush(&ch->io);
+     }
+ 
+@@ -691,7 +680,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
+     ch->regs[DBDMA_STATUS] = status;
+ 
+     /* If active, make sure the BH gets to run */
+-    if (status & ACTIVE) {
++    if (!ch->clock && (status & ACTIVE)) {
+         DBDMA_kick(dbdma_from_ch(ch));
+     }
+ }
+@@ -709,6 +698,11 @@ static void dbdma_write(void *opaque, hwaddr addr,
+     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
+                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
+ 
++    /* Settle the paced channel before changing its control or conditions. */
++    if (ch->clock) {
++        ch->clock(ch->io.opaque);
++    }
++
+     /* cmdptr cannot be modified if channel is ACTIVE */
+ 
+     if (reg == DBDMA_CMDPTR_LO && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+@@ -722,6 +716,10 @@ static void dbdma_write(void *opaque, hwaddr addr,
+         dbdma_control_write(ch);
+         break;
+     case DBDMA_CMDPTR_LO:
++        ch->waiting = false;
++        if (ch->clock) {
++            ch->io.processing = false;
++        }
+         /* 16-byte aligned */
+         ch->regs[DBDMA_CMDPTR_LO] &= ~0xf;
+         dbdma_cmdptr_load(ch);
+@@ -745,6 +743,11 @@ static void dbdma_write(void *opaque, hwaddr addr,
+         /* unused */
+         break;
+     }
++    if (ch->clock) {
++        ch->clock(ch->io.opaque);
++    } else if (reg == DBDMA_WAIT_SEL && ch->waiting) {
++        DBDMA_kick(s);
++    }
+ }
+ 
+ static uint64_t dbdma_read(void *opaque, hwaddr addr,
+@@ -832,6 +835,24 @@ static const VMStateDescription vmstate_dbdma_cmd = {
+     }
+ };
+ 
++static bool dbdma_waiting_needed(void *opaque)
++{
++    DBDMA_channel *ch = opaque;
++
++    return ch->waiting;
++}
++
++static const VMStateDescription vmstate_dbdma_waiting = {
++    .name = "dbdma_channel/waiting",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = dbdma_waiting_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL(waiting, DBDMA_channel),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_dbdma_channel = {
+     .name = "dbdma_channel",
+     .version_id = 1,
+@@ -842,6 +863,10 @@ static const VMStateDescription vmstate_dbdma_channel = {
+         VMSTATE_STRUCT(current, struct DBDMA_channel, 0, vmstate_dbdma_cmd,
+                        dbdma_cmd),
+         VMSTATE_END_OF_LIST()
++    },
++    .subsections = (const VMStateDescription * const []) {
++        &vmstate_dbdma_waiting,
++        NULL
+     }
+ };
+ 
+@@ -862,7 +887,14 @@ static void mac_dbdma_reset(DeviceState *d)
+     int i;
+ 
+     for (i = 0; i < DBDMA_CHANNELS; i++) {
+-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
++        DBDMA_channel *ch = &s->channels[i];
++
++        memset(ch->regs, 0, sizeof(ch->regs));
++        memset(&ch->current, 0, sizeof(ch->current));
++        ch->io = (DBDMA_io) {
++            .channel = ch, .opaque = ch->io.opaque, .dma_end = dbdma_end,
++        };
++        ch->waiting = false;
+     }
+ }
+ 
+diff --git a/include/hw/audio/screamer.h b/include/hw/audio/screamer.h
+index 5c71b0ab8..4875c4621 100644
+--- a/include/hw/audio/screamer.h
++++ b/include/hw/audio/screamer.h
+@@ -29,12 +29,12 @@
+ #include "hw/core/sysbus.h"
+ #include "hw/ppc/mac_dbdma.h"
+ #include "qemu/audio.h"
++#include "qemu/fifo8.h"
++#include "qemu/timer.h"
+ 
+ #define TYPE_SCREAMER "screamer"
+ OBJECT_DECLARE_SIMPLE_TYPE(ScreamerState, SCREAMER)
+ 
+-#define SCREAMER_BUFFER_SIZE 0x4000
+-
+ struct ScreamerState {
+     /*< private >*/
+     SysBusDevice parent_obj;
+@@ -42,23 +42,19 @@ struct ScreamerState {
+     /*< public >*/
+     MemoryRegion mem;
+     qemu_irq irq;
+-    void *dbdma;
++    DBDMA_channel *tx;
+     qemu_irq dma_tx_irq;
+     qemu_irq dma_rx_irq;
+ 
+     AudioBackend *be;
+     SWVoiceOut *voice;
+-    uint8_t *mixbuf;
+-    int samples;
+-    int shift;
+-
+-    uint32_t wpos;
+-    uint32_t rpos;
+-
+-    uint32_t bpos;
+-    uint32_t ppos;
+-    uint32_t rate;
+-    DBDMA_io io;
++    Fifo8 fifo;
++    QEMUTimer timer;
++    int64_t last_ns;
++    int64_t lag_ns;
++    int64_t fraction;
++    int rate;
++    int trim;
+ 
+     uint32_t regs[6];
+     uint32_t codec_ctrl_regs[8];
+diff --git a/include/hw/ppc/mac_dbdma.h b/include/hw/ppc/mac_dbdma.h
+index e42805144..e6697ab05 100644
+--- a/include/hw/ppc/mac_dbdma.h
++++ b/include/hw/ppc/mac_dbdma.h
+@@ -154,6 +154,9 @@ typedef struct DBDMA_channel {
+     DBDMA_io io;
+     DBDMA_rw rw;
+     DBDMA_flush flush;
++    /* A clocked channel is stepped by its device instead of the shared BH. */
++    void (*clock)(void *opaque);
++    bool waiting;
+     dbdma_cmd current;
+ } DBDMA_channel;
+ 
+@@ -168,11 +171,18 @@ struct DBDMAState {
+ #define TYPE_MAC_DBDMA "mac-dbdma"
+ OBJECT_DECLARE_SIMPLE_TYPE(DBDMAState, MAC_DBDMA)
+ 
++static inline DBDMAState *dbdma_from_ch(DBDMA_channel *ch)
++{
++    return container_of(ch, DBDMAState, channels[ch->channel]);
++}
++
+ /* Externally callable functions */
+ 
+-void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
+-                            DBDMA_rw rw, DBDMA_flush flush,
+-                            void *opaque);
++DBDMA_channel *DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
++                                      DBDMA_rw rw, DBDMA_flush flush,
++                                      void *opaque);
++bool DBDMA_channel_running(DBDMA_channel *ch);
++void DBDMA_run_channel(DBDMA_channel *ch);
+ void DBDMA_kick(DBDMAState *dbdma);
+ 
+ #endif
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 78b301064..2914f869d 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -177,6 +177,7 @@ qtests_mips64el = qtests_mips
+ 
+ qtests_ppc = \
+   qtests_filter + \
++  (config_all_devices.has_key('CONFIG_SCREAMER') ? ['screamer-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) +            \
+   (config_all_accel.has_key('CONFIG_TCG') ? ['prom-env-test'] : []) +                              \
+   (config_all_accel.has_key('CONFIG_TCG') ? ['boot-serial-test'] : []) +                           \
+diff --git a/tests/qtest/screamer-test.c b/tests/qtest/screamer-test.c
+new file mode 100644
+index 000000000..350a06d02
+--- /dev/null
++++ b/tests/qtest/screamer-test.c
+@@ -0,0 +1,313 @@
++/*
++ * PowerMac Screamer output tests.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "libqtest.h"
++#include "hw/ppc/mac_dbdma.h"
++#include "qemu/bswap.h"
++
++#define MACIO       0x80000000u
++#define TX          (MACIO + 0x8800)
++#define SOUND       (MACIO + 0x14000)
++#define FRAME_COUNT (SOUND + 0x50)
++#define COMMANDS    0x10000
++#define PCM         0x20000
++
++static void write_le32(QTestState *qts, uint32_t addr, uint32_t value)
++{
++    uint32_t le = cpu_to_le32(value);
++
++    qtest_memwrite(qts, addr, &le, sizeof(le));
++}
++
++static uint32_t read_le32(QTestState *qts, uint32_t addr)
++{
++    uint32_t le;
++
++    qtest_memread(qts, addr, &le, sizeof(le));
++    return le32_to_cpu(le);
++}
++
++static void map_macio(QTestState *qts)
++{
++    /* Program the MacIO BAR through UniNorth's PCI config window. */
++    write_le32(qts, 0xf2800000, 0x80006000);
++    g_assert_cmphex(read_le32(qts, 0xf2c00000), ==, 0x0022106b);
++    write_le32(qts, 0xf2800000, 0x80006010);
++    write_le32(qts, 0xf2c00000, MACIO);
++    write_le32(qts, 0xf2800000, 0x80006004);
++    write_le32(qts, 0xf2c00000, 2);
++}
++
++static QTestState *boot(const char *audiodev)
++{
++    QTestState *qts = qtest_initf("-M mac99 -cpu 7400 -nodefaults "
++                                  "-audiodev %s -global screamer.audiodev=snd",
++                                  audiodev);
++
++    map_macio(qts);
++    return qts;
++}
++
++static void descriptor(QTestState *qts, int index, uint16_t cmd,
++                       uint16_t bytes, int branch)
++{
++    dbdma_cmd desc = {
++        .command = cpu_to_le16(cmd),
++        .req_count = cpu_to_le16(bytes),
++        .phy_addr = cpu_to_le32(PCM),
++        .cmd_dep = cpu_to_le32(COMMANDS + branch * sizeof(desc)),
++    };
++
++    qtest_memwrite(qts, COMMANDS + index * sizeof(desc), &desc, sizeof(desc));
++}
++
++static void control(QTestState *qts, uint16_t mask, uint16_t value)
++{
++    write_le32(qts, TX, (uint32_t)mask << 16 | value);
++}
++
++static void start(QTestState *qts)
++{
++    write_le32(qts, TX + 4 * DBDMA_CMDPTR_LO, COMMANDS);
++    control(qts, RUN, RUN);
++}
++
++static void test_pacing(void)
++{
++    QTestState *qts = boot("none,id=snd");
++
++    qtest_irq_intercept_in(qts, "pic");
++    descriptor(qts, 0, OUTPUT_MORE, 16 * 4, 0);
++    descriptor(qts, 1, DBDMA_NOP, 0, 0);
++    descriptor(qts, 2, OUTPUT_LAST | BR_ALWAYS | INTR_ALWAYS, 16 * 4, 0);
++    start(qts);
++
++    for (int i = 1; i <= 44; i++) {
++        int64_t deadline = DIV_ROUND_UP((int64_t)i * 1000000000, 44100);
++
++        qtest_clock_set(qts, deadline - 1);
++        g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, i - 1);
++        g_assert_cmpint(qtest_get_irq(qts, 9), ==, i > 32);
++        qtest_clock_set(qts, deadline);
++        g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, i);
++        g_assert_cmpint(qtest_get_irq(qts, 9), ==, i >= 32);
++    }
++    qtest_quit(qts);
++}
++
++static void test_counter_write(void)
++{
++    QTestState *qts = boot("none,id=snd");
++
++    descriptor(qts, 0, OUTPUT_MORE | BR_ALWAYS, 512, 0);
++    start(qts);
++    qtest_clock_step(qts, 250000);
++    write_le32(qts, FRAME_COUNT, UINT32_MAX - 3);
++    qtest_clock_step(qts, 250000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 7);
++    qtest_quit(qts);
++}
++
++static void test_abort(gconstpointer data)
++{
++    int flush = GPOINTER_TO_INT(data);
++    QTestState *qts = boot("none,id=snd");
++    dbdma_cmd desc;
++
++    descriptor(qts, 0, OUTPUT_MORE, 512, 0);
++    descriptor(qts, 1, OUTPUT_LAST | INTR_ALWAYS, 4, 0);
++    start(qts);
++    qtest_clock_step(qts, 777777);
++    control(qts, flush ? FLUSH : RUN, flush ? FLUSH : 0);
++    qtest_memread(qts, COMMANDS, &desc, sizeof(desc));
++    g_assert_cmpuint(le16_to_cpu(desc.res_count), ==, 512 - 34 * 4);
++    g_assert_cmphex(le16_to_cpu(desc.xfer_status), ==,
++                    RUN | ACTIVE | (flush ? FLUSH : 0));
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 34);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_CMDPTR_LO), ==, COMMANDS);
++    qtest_memread(qts, COMMANDS + sizeof(desc), &desc, sizeof(desc));
++    g_assert_cmphex(desc.xfer_status, ==, 0);
++
++    start(qts);
++    qtest_clock_step(qts, 500000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 56);
++    qtest_quit(qts);
++}
++
++static void test_pause_wait(void)
++{
++    QTestState *qts = boot("none,id=snd");
++
++    write_le32(qts, TX + 4 * DBDMA_WAIT_SEL, 0x10001);
++    write_le32(qts, TX + 4 * DBDMA_BRANCH_SEL, 0x10001);
++    descriptor(qts, 0, OUTPUT_MORE | WAIT_IFCLR | BR_IFSET, 32 * 4, 2);
++    descriptor(qts, 1, OUTPUT_MORE, 512, 0);
++    descriptor(qts, 2, OUTPUT_LAST | WAIT_ALWAYS, 4, 0);
++    start(qts);
++    qtest_clock_step(qts, 250000);
++    control(qts, PAUSE, PAUSE);
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 11);
++    control(qts, PAUSE, 0);
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 32);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_CMDPTR_LO), ==, COMMANDS);
++    control(qts, 1, 1);
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 33);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_CMDPTR_LO), ==,
++                    COMMANDS + 2 * sizeof(dbdma_cmd));
++    qtest_quit(qts);
++}
++
++static void test_empty_loop(gconstpointer data)
++{
++    QTestState *qts = boot("none,id=snd");
++    int bytes = GPOINTER_TO_INT(data);
++
++    descriptor(qts, 0, OUTPUT_LAST | BR_ALWAYS, bytes, 0);
++    start(qts);
++    qtest_clock_step(qts, 1000000);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_STATUS) & BT, ==, BT);
++    control(qts, RUN, 0);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_nop_chain(void)
++{
++    QTestState *qts = boot("none,id=snd");
++
++    for (int i = 0; i < 130; i++) {
++        descriptor(qts, i, DBDMA_NOP, 0, 0);
++    }
++    descriptor(qts, 130, OUTPUT_MORE | BR_ALWAYS, 512, 130);
++    start(qts);
++    qtest_clock_step(qts, 500000);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_CMDPTR_LO), <,
++                    COMMANDS + 130 * sizeof(dbdma_cmd));
++    qtest_clock_step(qts, 500000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 44);
++    qtest_quit(qts);
++}
++
++static void test_reset(void)
++{
++    QTestState *qts = boot("none,id=snd");
++
++    descriptor(qts, 0, OUTPUT_MORE, 512, 0);
++    start(qts);
++    qtest_clock_step(qts, 500000);
++    qtest_system_reset(qts);
++    map_macio(qts);
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 0);
++    g_assert_cmphex(read_le32(qts, TX + 4 * DBDMA_STATUS), ==, 0);
++    descriptor(qts, 0, OUTPUT_LAST, 4, 0);
++    descriptor(qts, 1, DBDMA_STOP, 0, 0);
++    start(qts);
++    qtest_clock_step(qts, 500000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 1);
++    qtest_quit(qts);
++}
++
++static void test_rates(void)
++{
++    static const int rates[] = {
++        44100, 29400, 22050, 17640, 14700, 11025, 8820, 7350
++    };
++    QTestState *qts = boot("none,id=snd");
++    int64_t phase = 0;
++
++    descriptor(qts, 0, OUTPUT_MORE | BR_ALWAYS, 256, 0);
++    start(qts);
++    for (int i = 0; i < ARRAY_SIZE(rates); i++) {
++        write_le32(qts, SOUND, i << 8);
++        qtest_clock_step(qts, 1250000);
++        phase += 1250000LL * rates[i];
++    }
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, phase / 1000000000);
++    qtest_quit(qts);
++}
++
++static void test_short_sound(gconstpointer data)
++{
++    g_autofree char *path = NULL;
++    g_autofree char *audiodev = NULL;
++    g_autofree char *wav = NULL;
++    int rate = GPOINTER_TO_INT(data);
++    uint8_t samples[32 * 4];
++    size_t length;
++    QTestState *qts;
++    int fd = g_file_open_tmp("screamer-XXXXXX", &path, NULL);
++
++    g_assert_cmpint(fd, >=, 0);
++    close(fd);
++    audiodev = g_strdup_printf("wav,id=snd,out.frequency=%d,path=%s",
++                               rate, path);
++    qts = boot(audiodev);
++    descriptor(qts, 0, OUTPUT_LAST, sizeof(samples), 0);
++    descriptor(qts, 1, DBDMA_STOP, 0, 0);
++    start(qts);
++
++    for (int i = 0; i < 32; i++) {
++        /* Set each stereo frame just before its sample deadline. */
++        int periods = i + 1;
++        uint8_t *frame = samples + 4 * i;
++
++        if (rate == 22050 && i >= 16) {
++            if (i == 16) {
++                qtest_clock_set(qts, DIV_ROUND_UP(16000000000LL, 44100));
++                write_le32(qts, SOUND, 2 << 8);
++            }
++            periods += i + 1 - 16;
++        }
++        qtest_clock_set(qts, DIV_ROUND_UP(periods * 1000000000LL, 44100) - 1);
++        stw_be_p(frame, 0x1000 + i);
++        stw_be_p(frame + 2, 0x7000 - i);
++        qtest_memwrite(qts, PCM + 4 * i, frame, 4);
++    }
++    qtest_clock_step(qts, 100000000);
++    g_assert_cmpuint(read_le32(qts, FRAME_COUNT), ==, 32);
++    qtest_qmp_assert_success(qts, "{ 'execute': 'quit' }");
++    qtest_wait_qemu(qts);
++    qtest_quit(qts);
++
++    g_assert_true(g_file_get_contents(path, &wav, &length, NULL));
++    unlink(path);
++    g_assert_cmpuint(length, ==, 44 + sizeof(samples));
++    for (int i = 0; i < sizeof(samples); i += 2) {
++        g_assert_cmphex(lduw_le_p(wav + 44 + i), ==, lduw_be_p(samples + i));
++    }
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++
++    if (qtest_has_machine("mac99")) {
++        qtest_add_func("screamer/pacing", test_pacing);
++        qtest_add_func("screamer/counter-write", test_counter_write);
++        qtest_add_data_func("screamer/stop", GINT_TO_POINTER(0), test_abort);
++        qtest_add_data_func("screamer/flush", GINT_TO_POINTER(1), test_abort);
++        qtest_add_func("screamer/pause-wait", test_pause_wait);
++        qtest_add_data_func("screamer/zero-length", GINT_TO_POINTER(0),
++                            test_empty_loop);
++        qtest_add_data_func("screamer/partial-frame", GINT_TO_POINTER(1),
++                            test_empty_loop);
++        qtest_add_func("screamer/nop-chain", test_nop_chain);
++        qtest_add_func("screamer/reset", test_reset);
++        qtest_add_func("screamer/rates", test_rates);
++        qtest_add_data_func("screamer/short-sound", GINT_TO_POINTER(44100),
++                            test_short_sound);
++        qtest_add_data_func("screamer/rate-switch-wav", GINT_TO_POINTER(22050),
++                            test_short_sound);
++    }
++
++    return g_test_run();
++}
+-- 
+2.43.0
+

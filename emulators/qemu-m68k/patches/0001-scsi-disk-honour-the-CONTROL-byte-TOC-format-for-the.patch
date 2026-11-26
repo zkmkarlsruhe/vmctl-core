@@ -1,0 +1,132 @@
+From 18e578ce45b315f32676b7d9d3910d217c049bf1 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Mon, 5 Oct 2026 15:53:05 +0200
+Subject: [PATCH 1/3] scsi-disk: honour the CONTROL byte TOC format for the
+ q800 CD-ROM
+
+Apple's CD-ROM driver (Apple CD-ROM 5.1.7 as shipped with System
+7.5.3) issues READ TOC with the format field in byte 2 set to zero and
+selects the response format through the vendor specific bits 7-6 of
+the CONTROL byte instead: 0x40 for the session information and 0x80
+for the full (raw) TOC. This is how SCSI-2 era Matshita drives such
+as the CR-8005 (AppleCD 600i), which the q800 machine reports for
+scsi-cd, behaved. Those drives return the full TOC addresses in BCD.
+
+QEMU ignores the CONTROL byte and answers both requests with a format
+0 TOC. The driver then decodes the lead-out from the wrong offsets,
+computes a track length of zero and fails every read from a disc that
+has no Apple partition map with paramErr. A bare HFS CD image (the
+common case for discs that were pressed without a partition map)
+therefore fails to mount on System 7 with "Disk initialization failed
+because the disk is locked!". Discs with a partition map only work
+because the ROM loads the Apple_Driver43 from the disc itself.
+
+With the format honoured but binary addresses, the driver decodes
+65:42:38 as BCD and sizes a 577 MiB disc to 364 MiB, so applications
+stored near the end of the disc fail to open with a disk error.
+
+Add a quirk that takes the format from the CONTROL byte when the
+format field is zero and returns BCD MSF addresses in the full TOC,
+and enable it for scsi-cd on the q800 machine. hw/ide/atapi.c already
+honours the CONTROL byte format for ATAPI.
+
+Tested with System 7.5.3 on q800: a bare HFS CD image now mounts and
+the application on it runs; CDs with an Apple partition map still
+boot and mount.
+---
+ hw/m68k/q800.c         |  1 +
+ hw/scsi/scsi-disk.c    | 28 +++++++++++++++++++++++++++-
+ include/hw/scsi/scsi.h |  1 +
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/hw/m68k/q800.c b/hw/m68k/q800.c
+index ab64250c47..5d0cb4d483 100644
+--- a/hw/m68k/q800.c
++++ b/hw/m68k/q800.c
+@@ -717,6 +717,7 @@ static GlobalProperty hw_compat_q800[] = {
+     { "scsi-cd", "quirk_mode_sense_rom_use_dbd", "on" },
+     { "scsi-cd", "quirk_mode_page_vendor_specific_apple", "on" },
+     { "scsi-cd", "quirk_mode_page_truncated", "on" },
++    { "scsi-cd", "quirk_read_toc_control_format", "on" },
+     { "scsi-cd", "vendor", "MATSHITA" },
+     { "scsi-cd", "product", "CD-ROM CR-8005" },
+     { "scsi-cd", "ver", "1.0k" },
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index 1b0cce128c..673c8b3be0 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -41,6 +41,7 @@
+ #include "hw/core/qdev-properties-system.h"
+ #include "system/dma.h"
+ #include "system/system.h"
++#include "qemu/bcd.h"
+ #include "qemu/cutils.h"
+ #include "trace.h"
+ #include "qom/object.h"
+@@ -1444,12 +1445,25 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
+ static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
+ {
+     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
+-    int start_track, format, msf, toclen;
++    int start_track, format, msf, toclen, i, j;
++    bool bcd = false;
+     uint64_t nb_sectors;
+ 
+     msf = req->cmd.buf[1] & 2;
+     format = req->cmd.buf[2] & 0xf;
+     start_track = req->cmd.buf[6];
++    /*
++     * SCSI-2 era drives such as the Matshita CR-8005 (AppleCD 600i) take
++     * the response format from the vendor specific bits 7-6 of the CONTROL
++     * byte: 0x40 selects the session info and 0x80 the full TOC, which
++     * these drives return with BCD addresses.  Apple's CD-ROM driver
++     * relies on both to size a disc without a partition map.
++     */
++    if (format == 0 &&
++        (s->quirks & (1 << SCSI_DISK_QUIRK_READ_TOC_CONTROL_FORMAT))) {
++        format = req->cmd.buf[9] >> 6;
++        bcd = format == 2;
++    }
+     blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
+     trace_scsi_disk_emulate_read_toc(start_track, format, msf >> 1);
+     nb_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
+@@ -1467,6 +1481,16 @@ static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
+         break;
+     case 2:
+         toclen = cdrom_read_toc_raw(nb_sectors, outbuf, msf, start_track);
++        if (bcd && msf) {
++            /* MIN/SEC/FRAME and PMIN/PSEC/PFRAME of each 11-byte entry */
++            for (i = 4; i + 11 <= toclen; i += 11) {
++                for (j = 4; j < 11; j++) {
++                    if (j != 7) {
++                        outbuf[i + j] = to_bcd(outbuf[i + j]);
++                    }
++                }
++            }
++        }
+         break;
+     default:
+         return -1;
+@@ -3351,6 +3375,8 @@ static const Property scsi_cd_properties[] = {
+                     0),
+     DEFINE_PROP_BIT("quirk_mode_page_truncated", SCSIDiskState, quirks,
+                     SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED, 0),
++    DEFINE_PROP_BIT("quirk_read_toc_control_format", SCSIDiskState,
++                    quirks, SCSI_DISK_QUIRK_READ_TOC_CONTROL_FORMAT, 0),
+ };
+ 
+ static void scsi_cd_class_initfn(ObjectClass *klass, const void *data)
+diff --git a/include/hw/scsi/scsi.h b/include/hw/scsi/scsi.h
+index c60c6e8810..ceec7cd61c 100644
+--- a/include/hw/scsi/scsi.h
++++ b/include/hw/scsi/scsi.h
+@@ -262,5 +262,6 @@ bool scsi_generic_pr_state_preempt(SCSIDevice *s, Error **errp);
+ #define SCSI_DISK_QUIRK_MODE_SENSE_ROM_USE_DBD             1
+ #define SCSI_DISK_QUIRK_MODE_PAGE_VENDOR_SPECIFIC_APPLE    2
+ #define SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED                3
++#define SCSI_DISK_QUIRK_READ_TOC_CONTROL_FORMAT            5
+ 
+ #endif
+-- 
+2.43.0
+

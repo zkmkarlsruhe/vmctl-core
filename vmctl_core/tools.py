@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .atomicio import write_text_atomic
+from .paths import safe_segment
 
 
 def _now() -> str:
@@ -32,22 +33,11 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _safe_segment(seg: str, *, field: str) -> str:
-    """Guard one path SEGMENT of a tool's on-disk location (os / runtime / version).
-
-    Mirrors drive.py's ``ArtworkDrive.create`` id guard: a segment must be a bare name
-    with no separators and no ``.``/``..``, so an interpolated value like ``os="../../etc"``
-    can't climb out of the tools root when we build ``<root>/<os>/<runtime>/<version>``."""
-    if not seg or seg in (".", "..") or seg != Path(seg).name:
-        raise ValueError(f"{field} must be a bare path segment, got {seg!r}")
-    return seg
-
-
 def _confined_path(root: Path, rel: str) -> Path:
     """Resolve ``root/rel`` and confine it under ``root``; raise on escape.
 
     ``rel`` is a tool's catalogued ``path``. It is trusted-ish input, but a poisoned
-    catalog.json entry (e.g. ``path="../../../home/scharc/.ssh/id_ed25519"``) would let a
+    catalog.json entry (e.g. ``path="../../../home/user/.ssh/id_ed25519"``) would let a
     load/use/unlink reach outside the tools root. Reject anything that resolves outside."""
     base = root.resolve()
     target = (root / rel).resolve()
@@ -90,9 +80,9 @@ CATEGORIES: tuple[str, ...] = (
     "unpacker",  # archive/format extractors for artwork payloads (StuffIt Expander, The Unarchiver/unar)
 )
 
-# Legacy free-text `category` values (pre-refactor, still in old catalogs) -> canonical
-# function. Used by the id/category migration (scripts/migrate_tool_ids.py) and tolerated
-# on load so old entries keep resolving until migrated. (virtio-driver has no target — a
+# Legacy free-text `category` values (pre-refactor) -> canonical function. The 2026-07
+# migration is done (the live catalog carries none); the map stays so an API edit that still
+# sends an old value keeps resolving. (virtio-driver has no target — a
 # driver belongs in the golden, not this catalog; no such entries exist to migrate.)
 LEGACY_CATEGORY_MAP: dict[str, str] = {
     "flash-player": "runtime",
@@ -486,113 +476,6 @@ class ToolsLibrary:
             self.save()
             return tool
 
-    # --- research/65 §B: the dependency / Technical-Environment resolver -------
-    # The flat catalog + Tool.relations form a graph. These read-only methods turn a
-    # format need into the runnable stack (PREMIS Technical Environment) the AI analyst
-    # asks for: "this work needs application/x-director on windows-xp" -> the binary, its
-    # dependency chain, its conservation quirks, and its alternatives.
-
-    def reads(
-        self, *, mime: str | None = None, ext: str | None = None, puid: str | None = None
-    ) -> builtins.list[Tool]:
-        """Tools that can READ a format — via handles_mime/handles_ext OR a reads_format
-        relation (PRONOM PUID or MIME). Any provided key that matches counts."""
-
-        def hit(t: Tool) -> bool:
-            if mime and mime in t.handles_mime:
-                return True
-            if ext and ext in t.handles_ext:
-                return True
-            for r in t.relations:
-                if r.get("rel") != "reads_format":
-                    continue
-                if puid and r.get("target") == puid:
-                    return True
-                if mime and (r.get("mime") == mime or r.get("target") == mime):
-                    return True
-            return False
-
-        with self._lock:
-            return [t for t in self.tools.values() if hit(t)]
-
-    def technical_environment(self, tool_id: str) -> dict:
-        """The runnable stack for one tool: its OS band, the recursive depends_on chain,
-        conservation quirks (network-bootstrap / known-CVE / notes), and alternatives.
-        A dependency `target_id` that isn't in the catalog is still listed (a known gap)."""
-        with self._lock:
-            t = self.tools[tool_id]  # KeyError -> 404 at the API layer
-            deps: builtins.list[dict] = []
-            seen: set[str] = {tool_id}
-
-            def walk(tid: str) -> None:
-                node = self.tools.get(tid)
-                if node is None:
-                    return
-                for r in node.relations:
-                    if r.get("rel") != "depends_on":
-                        continue
-                    dep = r.get("target_id") or r.get("target")
-                    if not dep or dep in seen:
-                        continue
-                    seen.add(dep)
-                    deps.append(
-                        {"id": dep, "note": r.get("note", ""), "in_catalog": dep in self.tools}
-                    )
-                    walk(dep)
-
-            walk(tool_id)
-            quirks: builtins.list[str] = []
-            if t.network_required or t.install_mode == "network-bootstrap":
-                quirks.append(
-                    "network-bootstrap installer — vendor URLs may be dead; host payload locally"
-                )
-            if t.known_cves:
-                quirks.append(
-                    f"keep the guest OFFLINE — {len(t.known_cves)} known unpatched CVE(s)"
-                )
-            alternatives = [
-                (r.get("target_id") or r.get("target"))
-                for r in t.relations
-                if r.get("rel") == "alternative_to"
-            ]
-            return {
-                "tool": tool_id,
-                "name": t.name,
-                "present": t.present,
-                "os_compat": list(t.os_compat),
-                "install": t.install_mode,
-                "depends_on": deps,
-                "alternatives": [a for a in alternatives if a],
-                "quirks": quirks,
-            }
-
-    def resolve(
-        self,
-        *,
-        mime: str | None = None,
-        ext: str | None = None,
-        puid: str | None = None,
-        os: str | None = None,
-    ) -> builtins.list[dict]:
-        """AI entrypoint: a format (+ optional target OS) -> ranked runnable stacks.
-
-        Ranks OS-matching first, then present-on-disk, then most-complete. Never filters
-        the OS mismatch OUT (returns it ranked lower) so the analyst still sees a tool
-        that reads the format even if the era isn't perfect."""
-        with self._lock:
-            cands = self.reads(mime=mime, ext=ext, puid=puid)
-            cands.sort(
-                key=lambda t: (
-                    not t.matches_os(os) if os else False,
-                    not t.present,
-                    -t.completeness(),
-                )
-            )
-            return [
-                {**self.technical_environment(t.id), "os_match": t.matches_os(os) if os else None}
-                for t in cands
-            ]
-
     # --- CRUD on existing entries ----------------------------------------
     # Editable metadata fields (everything except the file-derived identity:
     # id/path/size/sha256 are set by add_file and must not drift from the binary).
@@ -737,9 +620,10 @@ class ToolsLibrary:
         # on-disk path, so a value like os="../../etc" would escape the tools root. Guard
         # each as a bare segment (mirrors drive.py's create() id guard), then assert the
         # assembled dest_dir still resolves under root as belt-and-suspenders.
-        _safe_segment(os, field="os")
-        _safe_segment(runtime, field="runtime")
-        _safe_segment(version, field="version")
+        # <root>/<os>/<runtime>/<version>: each must be a bare segment (paths.safe_segment).
+        safe_segment(os, field="os")
+        safe_segment(runtime, field="runtime")
+        safe_segment(version, field="version")
         dest_dir = self.root / os / runtime / version
         if not dest_dir.resolve().is_relative_to(self.root.resolve()):
             raise ValueError(f"tool dest {dest_dir} escapes the tools root")

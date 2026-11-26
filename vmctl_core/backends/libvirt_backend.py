@@ -21,6 +21,11 @@ import zlib
 
 from .base import BackendError
 
+# Ceiling for guest_read_file's QGA loop: the guest decides how much it sends, so an
+# uncapped read buffers arbitrary guest data into controller RAM. 64 MiB covers every
+# legitimate use (configs, logs, captures); bulk transfers use the file portal.
+MAX_GUEST_READ_BYTES = 64 * 1024 * 1024
+
 
 def _read_ppm_token(buf: bytes, i: int) -> tuple[bytes, int]:
     """Read one whitespace-delimited header token from a PPM at offset ``i``,
@@ -94,6 +99,27 @@ def ppm_to_png(ppm: bytes) -> bytes:
     )
 
 
+def virsh(
+    uri: str, *args: str, timeout: float = 30.0, check: bool = True
+) -> subprocess.CompletedProcess:
+    """The one ``virsh`` wrapper (domains here, networks in ``project_net``)."""
+    cmd = ["virsh", "-c", uri, *args]
+    # Force the C locale: stop()/get_settings() and the state parsers key off
+    # English virsh output ("not running", "Max memory", "Autostart"); under a
+    # localized LANG those substring checks silently break (stop() would raise on
+    # an already-stopped domain; get_settings() would return defaults).
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as e:
+        # A hung libvirtd must surface as BackendError: state()/exists()/guest_ip()
+        # catch only that and would otherwise leak a traceback.
+        raise BackendError(f"virsh {' '.join(args)} timed out after {timeout:g}s") from e
+    if check and p.returncode != 0:
+        raise BackendError(f"virsh {' '.join(args)} failed: {p.stderr.strip()}")
+    return p
+
+
 class LibvirtBackend:
     """A VMBackend bound to a single libvirt domain."""
 
@@ -105,16 +131,7 @@ class LibvirtBackend:
     def _virsh(
         self, *args: str, timeout: float = 30.0, check: bool = True
     ) -> subprocess.CompletedProcess:
-        cmd = ["virsh", "-c", self.uri, *args]
-        # Force the C locale: stop()/get_settings() and the state parsers key off
-        # English virsh output ("not running", "Max memory", "Autostart"); under a
-        # localized LANG those substring checks silently break (stop() would raise on
-        # an already-stopped domain; get_settings() would return defaults).
-        env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        if check and p.returncode != 0:
-            raise BackendError(f"virsh {' '.join(args)} failed: {p.stderr.strip()}")
-        return p
+        return virsh(self.uri, *args, timeout=timeout, check=check)
 
     def _agent(self, payload: dict, timeout: float = 15.0) -> dict:
         """Run a qemu-agent-command and return the parsed ``return`` value."""
@@ -216,14 +233,6 @@ class LibvirtBackend:
     # NIC exists), so for ppc we resolve the lease by matching this file on the MAC.
     DNSMASQ_STATUS = "/var/lib/libvirt/dnsmasq/virbr0.status"
 
-    # Isolated host-only management network (containment for the legacy-TCP agent
-    # transport; see deploy/networks/rvmc-mgmt.xml + Hardware.mgmt_nic). When a domain
-    # carries a NIC on MGMT_NETWORK, guest_ip() returns ONLY an address inside
-    # MGMT_SUBNET so the controller/tcp_helper dial the isolated :9009, never the
-    # artwork NIC. Guests without a mgmt NIC keep the original first-lease behaviour.
-    MGMT_NETWORK = "rvmc-mgmt"
-    MGMT_SUBNET = ipaddress.IPv4Network("10.77.0.0/24")
-
     def _domain_arch(self) -> str | None:
         """The domain's OS arch (e.g. 'ppc', 'x86_64') from its XML, or None."""
         try:
@@ -259,6 +268,21 @@ class LibvirtBackend:
                 macs.append(val.split("mac=", 1)[1].split(",")[0].strip().lower())
         return macs
 
+    def _dnsmasq_status_path(self) -> str:
+        """The dnsmasq lease DB of the bridge the ppc tap is enslaved to (rvmc-p<idx>0 under
+        per-project nets, virbr0 legacy). Falls back to DNSMASQ_STATUS when the tap or its
+        master can't be read. Reading the CURRENT bridge's DB (not a fixed virbr0) also keeps
+        a stale pre-migration virbr0 lease for the same MAC from winning."""
+        tap = self._ppc_tap()
+        if tap:
+            p = subprocess.run(
+                ["ip", "-o", "link", "show", tap], capture_output=True, text=True, timeout=10
+            )
+            if p.returncode == 0 and " master " in p.stdout:
+                bridge = p.stdout.split(" master ", 1)[1].split()[0]
+                return os.path.join(os.path.dirname(self.DNSMASQ_STATUS), f"{bridge}.status")
+        return self.DNSMASQ_STATUS
+
     def _ip_from_dnsmasq(self, macs: list[str]) -> str | None:
         """Resolve an IPv4 lease for any of `macs` from libvirt's dnsmasq status DB.
         The fallback for the ppc cmdline NIC that domifaddr cannot see."""
@@ -266,7 +290,7 @@ class LibvirtBackend:
             return None
         want = {m.lower() for m in macs}
         try:
-            with open(self.DNSMASQ_STATUS) as f:
+            with open(self._dnsmasq_status_path()) as f:
                 leases = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None
@@ -277,44 +301,32 @@ class LibvirtBackend:
                 return ip
         return None
 
-    def _has_mgmt_nic(self) -> bool:
-        """True when the domain carries a NIC on the isolated MGMT_NETWORK (the
-        legacy-TCP containment NIC — Hardware.mgmt_nic). Guests with one get their
-        guest_ip() resolved on the mgmt subnet only.
+    QGA_CHANNEL = "org.qemu.guest_agent.0"
 
-        Raises (does NOT return False) on a dumpxml/parse ERROR: a transient dumpxml
-        failure is not evidence of "no mgmt NIC", and swallowing it would misclassify a
-        contained dual-NIC guest as single-NIC and hand its artwork-NIC lease to the
-        control plane (containment fails OPEN). Callers catch the error and fail CLOSED."""
-        root = ET.fromstring(self.dumpxml())
-        for src in root.findall("./devices/interface/source"):
-            if src.get("network") == self.MGMT_NETWORK:
-                return True
+    def _agent_available(self) -> bool:
+        """Mirror libvirt's own pre-check: no qemu-ga channel, or channel state
+        'disconnected', means libvirt rejects the call AND logs it as error. A missing
+        state attribute is let through, as libvirt does."""
+        try:
+            root = ET.fromstring(self.dumpxml())
+        except (BackendError, ET.ParseError):
+            return False
+        for t in root.findall("./devices/channel/target"):
+            if t.get("name") == self.QGA_CHANNEL:
+                return t.get("state") != "disconnected"
         return False
 
     def guest_ip(self) -> str | None:
         """Best-effort guest IPv4 (DHCP lease / ARP) — for reaching a TCP in-guest
         agent on guests without virtio-serial (e.g. pristine XP on rtl8139, or the
-        ppc/mac99 mac9 agent on its raw sungem NIC).
-
-        When the domain has an isolated management NIC (Hardware.mgmt_nic => a NIC on
-        MGMT_NETWORK), this returns ONLY an address inside MGMT_SUBNET (10.77.0.0/24)
-        so the controller/tcp_helper dial the contained :9009 and never fall back to
-        the artwork/NAT NIC. If the mgmt lease is not up yet it returns None (the
-        caller should retry) rather than leaking the artwork IP. Guests without a mgmt
-        NIC keep the original behaviour: the first non-loopback lease/ARP/agent addr."""
+        ppc/mac99 mac9 agent on its raw sungem NIC)."""
         # ppc/mac99: the sungem NIC is a raw qemu:commandline device that libvirt's
         # domifaddr is blind to. Resolve the lease directly from dnsmasq by MAC.
         if self._domain_arch() == "ppc":
             return self._ip_from_dnsmasq(self._domain_macs())
-        try:
-            prefer_mgmt = self._has_mgmt_nic()
-        except (BackendError, ET.ParseError):
-            # Can't read the domain's NIC topology -> fail CLOSED (return None so the
-            # caller retries) rather than defaulting to single-NIC and leaking the
-            # artwork lease to the control plane.
-            return None
         for src in ("lease", "arp", "agent"):
+            if src == "agent" and not self._agent_available():
+                break
             p = self._virsh("domifaddr", self.name, "--source", src, check=False)
             for line in p.stdout.splitlines():
                 for tok in line.split():
@@ -322,77 +334,8 @@ class LibvirtBackend:
                         ip = tok.split("/")[0]
                         if ip.startswith("127."):
                             continue
-                        if prefer_mgmt:
-                            # Containment: only accept the isolated mgmt subnet. Never
-                            # return the artwork NIC lease for a mgmt-NIC guest.
-                            try:
-                                if ipaddress.ip_address(ip) in self.MGMT_SUBNET:
-                                    return ip
-                            except ValueError:
-                                pass
-                            continue
                         return ip
         return None
-
-    def _leases(self) -> list[str]:
-        """Every non-loopback IPv4 the domain has (lease/ARP/agent, dnsmasq for ppc), in
-        discovery order. The raw material control_ip()/artwork_ip() split by subnet."""
-        if self._domain_arch() == "ppc":
-            ip = self._ip_from_dnsmasq(self._domain_macs())
-            return [ip] if ip else []
-        out: list[str] = []
-        for src in ("lease", "arp", "agent"):
-            p = self._virsh("domifaddr", self.name, "--source", src, check=False)
-            for line in p.stdout.splitlines():
-                for tok in line.split():
-                    if tok.count(".") == 3 and "/" in tok:
-                        ip = tok.split("/")[0]
-                        if not ip.startswith("127.") and ip not in out:
-                            out.append(ip)
-        return out
-
-    def control_ip(self) -> str | None:
-        """The IP the CONTROL plane (agent transport: tcp_helper / raw-TCP / poll) dials.
-
-        On a dual-homed guest with an isolated control NIC (Hardware.mgmt_nic on
-        MGMT_NETWORK) this is the mgmt-subnet (10.77.0.0/24) lease; on a single-NIC guest
-        it is the sole lease. Never the artwork NIC on a control-NIC guest. Same policy as
-        the legacy guest_ip(), named for its actual role. None if the mgmt lease isn't up."""
-        leases = self._leases()
-        try:
-            has_mgmt = self._has_mgmt_nic()
-        except (BackendError, ET.ParseError):
-            # dumpxml/parse failed: can't tell single- from dual-NIC, so fail CLOSED
-            # rather than hand leases[0] (possibly the artwork NIC) to the control plane.
-            return None
-        if has_mgmt:
-            for ip in leases:
-                with contextlib.suppress(ValueError):
-                    if ipaddress.ip_address(ip) in self.MGMT_SUBNET:
-                        return ip
-            return None
-        return leases[0] if leases else None
-
-    def artwork_ip(self) -> str | None:
-        """The IP the DATA plane sees for this guest — the artwork NIC. On a control-NIC
-        guest this is the NON-mgmt lease (so source-IP->project mapping, dnsmasq and the
-        router key on the artwork interface, NOT the isolated control NIC — the codex
-        split-brain guard). On a single-NIC guest it is the sole lease. None until a
-        non-mgmt lease is visible."""
-        leases = self._leases()
-        try:
-            has_mgmt = self._has_mgmt_nic()
-        except (BackendError, ET.ParseError):
-            # dumpxml/parse failed: can't tell whether a lease is the artwork NIC or the
-            # isolated mgmt NIC, so fail CLOSED rather than risk routing the mgmt IP.
-            return None
-        if has_mgmt:
-            for ip in leases:
-                with contextlib.suppress(ValueError):
-                    if ipaddress.ip_address(ip) not in self.MGMT_SUBNET:
-                        return ip
-            return None
-        return leases[0] if leases else None
 
     def define_xml(self, xml: str) -> None:
         """Validate + redefine the persistent config from an XML string.
@@ -455,9 +398,11 @@ class LibvirtBackend:
         return [s.strip() for s in p.stdout.splitlines() if s.strip()]
 
     def snapshot_create(self, name: str, *, memory: bool = True) -> None:
-        # Overwrite an existing snapshot of the same name (and its children).
+        # Overwrite an existing snapshot of the same name. Plain snapshot-delete keeps
+        # its children (libvirt reparents them); --children would silently delete every
+        # snapshot taken after it, and q800 only drops the one name too.
         if name in self.snapshot_list():
-            self._virsh("snapshot-delete", self.name, name, "--children", check=False)
+            self._virsh("snapshot-delete", self.name, name, check=False)
         args = ["snapshot-create-as", self.name, name]
         # --atomic is unsupported on the screamer-qemu PPC fork (mac99) — virsh
         # rejects it there. x86/KVM keeps the atomic guarantee; ppc takes the plain
@@ -465,9 +410,14 @@ class LibvirtBackend:
         if not self._is_ppc():
             args.append("--atomic")
         # Internal snapshot. When the domain is running this captures RAM too
-        # (exact-moment revert). disk-only is the crash-consistent fallback.
+        # (exact-moment revert). `--disk-only` on a running domain would make an
+        # EXTERNAL snapshot (a new overlay the registry never learns about, which
+        # snapshot_revert cannot revert), so refuse like q800 does.
         if not memory and self.is_running():
-            args.append("--disk-only")
+            raise BackendError(
+                "libvirt: a live snapshot always includes RAM; stop the domain "
+                "for a disk-only snapshot"
+            )
         self._virsh(*args, timeout=120.0)
 
     def snapshot_revert(self, name: str) -> None:
@@ -554,11 +504,26 @@ class LibvirtBackend:
         # definition to carry a `-drive ...,media=cdrom` for this ISO and reboot the
         # domain so OS 9 mounts the disc at startup. research/64.
         if self._is_ppc():
-            self._ppc_set_cdrom(str(iso_path))
+            if not self._ppc_set_cdrom(str(iso_path)) and self.is_running():
+                # Same ISO already attached, no reboot: if the guest ejected it (OS 9 Finder
+                # eject opens the tray), re-inserting must close the tray again or the disc
+                # never comes back.
+                self._ppc_close_open_trays()
             return
         self._virsh(
             "change-media", self.name, target, str(iso_path), "--update", *self._media_scope()
         )
+
+    def _ppc_close_open_trays(self) -> None:
+        p = self._virsh("qemu-monitor-command", self.name, '{"execute":"query-block"}', check=False)
+        try:
+            devices = json.loads(p.stdout).get("return", [])
+        except (ValueError, AttributeError):
+            return
+        for d in devices:
+            if d.get("removable") and d.get("tray_open") and d.get("inserted"):
+                cmd = {"execute": "blockdev-close-tray", "arguments": {"device": d["device"]}}
+                self._virsh("qemu-monitor-command", self.name, json.dumps(cmd), check=False)
 
     def eject_cd(self, target: str = "hdc") -> None:
         if self._is_ppc():
@@ -643,6 +608,8 @@ class LibvirtBackend:
 
     # --- guest agent ------------------------------------------------------
     def guest_ping(self, timeout: float = 5.0) -> bool:
+        if not self._agent_available():
+            return False
         try:
             self._agent({"execute": "guest-ping"}, timeout=timeout)
             return True
@@ -698,7 +665,8 @@ class LibvirtBackend:
                 "arguments": {"path": guest_path, "mode": "rb"},
             }
         )
-        data = b""
+        chunks: list[bytes] = []
+        size = 0
         try:
             while True:
                 r = self._agent(
@@ -708,23 +676,41 @@ class LibvirtBackend:
                     }
                 )
                 chunk = base64.b64decode(r.get("buf-b64", ""))
-                data += chunk
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_GUEST_READ_BYTES:
+                    # The guest controls how much it sends; without a ceiling a huge (or
+                    # lying) guest file buffers unbounded into controller RAM. Fail closed —
+                    # bulk transfers belong on the file portal, not the QGA read loop.
+                    raise BackendError(
+                        f"guest file {guest_path!r} exceeds the "
+                        f"{MAX_GUEST_READ_BYTES // (1024 * 1024)} MiB guest-read cap"
+                    )
                 if r.get("eof") or not chunk:
                     break
         finally:
             self._agent({"execute": "guest-file-close", "arguments": {"handle": handle}})
-        return data
+        return b"".join(chunks)
 
     # --- network ----------------------------------------------------------
     def net_info(self) -> dict:
-        subnet = self._discover_vm_network()
+        subnet = self.discover_vm_network()
         info: dict = {"subnet": subnet, "interfaces": []}
+        if not self._agent_available():
+            return info
         p = self._virsh("domifaddr", self.name, "--source", "agent", check=False)
         if p.returncode == 0:
             info["interfaces"] = [ln for ln in p.stdout.splitlines()[2:] if ln.strip()]
         return info
 
-    def _discover_vm_network(self) -> str | None:
+    def discover_vm_network(self) -> str | None:
+        """The subnet the domain's first `network`-type interface lives on, in CIDR.
+
+        Public because the exhibition controller's guest-origin guard needs it: it only trusts
+        callers from the VM's own subnet, so a controller that cannot derive the subnet fails
+        closed. Reaching for the private name across the package boundary would break silently
+        on any refactor here.
+        """
         try:
             p = self._virsh("domiflist", self.name, check=False)
             net = None
@@ -747,7 +733,7 @@ class LibvirtBackend:
 
     def _flush_conntrack(self) -> None:
         """Clear stale TCP NAT entries after a revert/start. Best-effort."""
-        subnet = self._discover_vm_network() or "192.168.122.0/24"
+        subnet = self.discover_vm_network() or "192.168.122.0/24"
         with contextlib.suppress(FileNotFoundError, subprocess.SubprocessError):
             subprocess.run(
                 ["conntrack", "-D", "-s", subnet],

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "description": [
+    "Auto-merge for patch+minor (stable, >=1.0.0, 3-day age) is enabled fleet-wide from the global config; gitops/* repos are auto-patch only (minor stays a reviewed MR). No per-repo preset needed."
+  ],
+  "registryAliases": {
+    "docker.io": "harbor.zkm.de/dockerhub-cache"
+  }
+}

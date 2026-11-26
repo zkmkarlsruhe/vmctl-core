@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from ..agentwire import Reply
 from ..catalog import BaseImage
 
 
@@ -26,8 +27,8 @@ class GuestContext(Protocol):
     instance_id: str
     base: BaseImage
 
-    def guest_call(self, tool: str, *, timeout: float = 30.0, **args: Any) -> dict:
-        """Invoke one agent tool in the guest (run_shell, python, reg_write, ...).
+    def guest_call(self, tool: str, *, timeout: float = 30.0, **args: Any) -> Reply:
+        """Invoke a VA1 tool and return Reply (kv, rows or raw bytes).
         Raises if the guest has no reachable agent — guard with the AGENT capability."""
 
     def guest_write_file(self, path: str, data: bytes) -> None: ...

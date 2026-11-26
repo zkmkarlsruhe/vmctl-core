@@ -3,7 +3,7 @@
 Each project gets its OWN isolated libvirt network so guests in different projects can
 never reach one another: separate bridge, separate /24, separate gateway + dnsmasq, and
 crucially NO ``<forward>`` element — libvirt then installs FORWARD rules that REJECT any
-traffic leaving the bridge (same containment shape as ``deploy/networks/rvmc-mgmt.xml``).
+traffic leaving the bridge.
 Inter-project isolation is therefore inherent in the topology, not a firewall bolt-on.
 
 This module is the hosting-neutral half (rvmc hosts it in-process today; evmctl reuses it
@@ -16,21 +16,25 @@ Addressing -- the ``10.177.0.0/16`` block, one ``/24`` per index (0-255):
   bridge    ``rvmc-p<idx>0``      dhcp     ``10.177.<idx>.2`` .. ``.254``
 The block was chosen against every route reachable on the rvmc host so a guest bridge can
 never shadow a real route: docker owns ``172.16/12``; tailscale CGNAT is ``100.64/10``; the
-tailnet advertises ``10.0.0.0/24`` / ``10.1.0.0/24`` and many ``192.168.x/24`` routes;
-rvmc-mgmt is ``10.77.0.0/24`` (distinct from ``10.177``). ``10.177/16`` collides with none
+tailnet advertises ``10.0.0.0/24`` / ``10.1.0.0/24`` and many ``192.168.x/24`` routes.
+``10.177/16`` collides with none
 and leaves the rest of ``10/8`` free.
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import ipaddress
 import os
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from .backends.base import BackendError
+from .backends.libvirt_backend import virsh
 
 #: second + third octet base — guest project nets live in 10.177.<idx>.0/24
 NET_SECOND_OCTET = 177
@@ -85,15 +89,24 @@ class ProjectNet:
             return False
 
 
+#: libvirt's dnsmasq passthrough namespace (``<dnsmasq:options>``)
+DNSMASQ_NS = "http://libvirt.org/schemas/network/dnsmasq/1.0"
+
+
 def render_network_xml(pn: ProjectNet) -> str:
     """The ISOLATED libvirt ``<network>`` XML for a project net — bridge + DHCP, and
     deliberately NO ``<forward>`` (the containment: libvirt REJECTs traffic off the
     bridge, so the guest reaches only its gateway, never another project or the LAN).
-    Mirrors ``deploy/networks/rvmc-mgmt.xml``."""
+
+    For an isolated net libvirt writes an EMPTY ``dhcp-option=3`` (no router), so guests
+    get no default route and off-subnet traffic never reaches the host. The dnsmasq
+    passthrough re-adds the gateway as router (it comes after libvirt's line in the conf):
+    off-subnet packets then land on the host, where PREROUTING DNAT can take them; FORWARD
+    still REJECTs everything else, so real internet stays blocked."""
     return (
         f"<!-- rvmc per-project isolated net (index {pn.index}). NO <forward>: "
         f"containment. Generated — do not hand-edit. -->\n"
-        f"<network>\n"
+        f"<network xmlns:dnsmasq='{DNSMASQ_NS}'>\n"
         f"  <name>{pn.name}</name>\n"
         f"  <bridge name='{pn.bridge}' stp='on' delay='0'/>\n"
         f"  <ip address='{pn.gateway}' netmask='{pn.netmask}'>\n"
@@ -101,8 +114,43 @@ def render_network_xml(pn: ProjectNet) -> str:
         f"      <range start='{pn.dhcp_start}' end='{pn.dhcp_end}'/>\n"
         f"    </dhcp>\n"
         f"  </ip>\n"
+        f"  <dnsmasq:options>\n"
+        f"    <dnsmasq:option value='dhcp-option=3,{pn.gateway}'/>\n"
+        f"  </dnsmasq:options>\n"
         f"</network>\n"
     )
+
+
+def _net_signature(xml: str) -> tuple:
+    """The fields of a network XML that rvmc owns, normalised so a ``net-dumpxml`` (which
+    adds uuid, mac, defaults) compares equal to :func:`render_network_xml` when nothing
+    relevant differs."""
+    root = ET.fromstring(xml)
+    ip = root.find("ip")
+    rng = ip.find("dhcp/range") if ip is not None else None
+    bridge = root.find("bridge")
+    return (
+        root.findtext("name"),
+        root.find("forward") is not None,
+        None if bridge is None else bridge.get("name"),
+        None if ip is None else (ip.get("address"), ip.get("netmask")),
+        None if rng is None else (rng.get("start"), rng.get("end")),
+        tuple(o.get("value") for o in root.iter(f"{{{DNSMASQ_NS}}}option")),
+    )
+
+
+# ensure() is check-then-define; parallel spawns in one project raced it and libvirt
+# logged "network 'rvmc-pN' already exists". flock per net name: locks bind to the open
+# file description, so it serialises threads (each opens its own fd) AND processes
+# (rvmc serve vs the rvmc CLI).
+# shortcut: lock dir is per user ($XDG_RUNTIME_DIR), so callers under different users
+# don't exclude each other; move to a shared dir if rvmc ever runs as several users.
+@contextlib.contextmanager
+def _ensure_lock(name: str) -> Iterator[None]:
+    lock_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    with open(os.path.join(lock_dir, f"vmctl-net-{name}.lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
 
 
 class LibvirtNetworks:
@@ -116,12 +164,7 @@ class LibvirtNetworks:
     def _virsh(
         self, *args: str, timeout: float = 30.0, check: bool = True
     ) -> subprocess.CompletedProcess:
-        cmd = ["virsh", "-c", self.uri, *args]
-        env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        if check and p.returncode != 0:
-            raise BackendError(f"virsh {' '.join(args)} failed: {p.stderr.strip()}")
-        return p
+        return virsh(self.uri, *args, timeout=timeout, check=check)
 
     def exists(self, name: str) -> bool:
         return self._virsh("net-info", name, check=False).returncode == 0
@@ -141,20 +184,25 @@ class LibvirtNetworks:
         p = self._virsh("net-list", "--all", "--name", check=False)
         return [n for n in p.stdout.split() if n]
 
+    def _define(self, xml: str, name: str) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", prefix=f"{name}-", delete=False) as f:
+            f.write(xml)
+            xml_path = f.name
+        try:
+            self._virsh("net-define", xml_path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(xml_path)
+
     def ensure(self, pn: ProjectNet) -> None:
         """Define + autostart + start the project net, idempotently. Safe to call on
         every spawn: an already-defined/active net is a no-op. Does NOT touch VMs."""
+        with _ensure_lock(pn.name):
+            self._ensure(pn)
+
+    def _ensure(self, pn: ProjectNet) -> None:
         if not self.exists(pn.name):
-            with tempfile.NamedTemporaryFile(
-                "w", suffix=".xml", prefix=f"{pn.name}-", delete=False
-            ) as f:
-                f.write(render_network_xml(pn))
-                xml_path = f.name
-            try:
-                self._virsh("net-define", xml_path)
-            finally:
-                with contextlib.suppress(OSError):
-                    os.unlink(xml_path)
+            self._define(render_network_xml(pn), pn.name)
         # autostart + start are individually idempotent (already-active start is an error
         # we swallow; net-autostart is a config flag).
         self._virsh("net-autostart", pn.name, check=False)
@@ -169,6 +217,32 @@ class LibvirtNetworks:
                     f"project net {pn.name!r} failed to start: "
                     f"{p.stderr.strip() or 'still inactive after net-start'}"
                 )
+
+    def redefine(self, pn: ProjectNet) -> bool:
+        """Bring an EXISTING project net in line with :func:`render_network_xml`.
+        Idempotent: returns False (no-op) when the live XML already matches. Otherwise
+        net-define (keeping uuid, mac and ``<dns>`` records), net-destroy, net-start and
+        returns True. A restart drops the bridge: attached guests lose their NIC link and
+        must be power-cycled by the caller. A missing net is left to :meth:`ensure`."""
+        if not self.exists(pn.name):
+            return False
+        current = self._virsh("net-dumpxml", pn.name).stdout
+        want = render_network_xml(pn)
+        if _net_signature(current) == _net_signature(want):
+            return False
+        # keep what libvirt/rvmc added at runtime: uuid (same uuid = libvirt updates the
+        # definition, autostart stays), bridge mac, and <dns> host records (vmctl.local)
+        cur, new = ET.fromstring(current), ET.fromstring(want)
+        for pos, tag in enumerate(("uuid", "mac", "dns"), start=1):
+            el = cur.find(tag)
+            if el is not None and new.find(tag) is None:
+                new.insert(pos, el)
+        ET.register_namespace("dnsmasq", DNSMASQ_NS)
+        want = ET.tostring(new, encoding="unicode")
+        self._define(want, pn.name)
+        self._virsh("net-destroy", pn.name, check=False)
+        self._virsh("net-start", pn.name)
+        return True
 
     def teardown(self, name: str) -> None:
         """Destroy (stop) + undefine a project net. Best-effort + idempotent — a missing

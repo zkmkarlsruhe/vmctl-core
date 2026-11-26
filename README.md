@@ -20,7 +20,7 @@ Shared foundation for ZKM's VM-conservation controllers. Provides:
 **Dependency rule:** apps depend on core; core never imports an app. This keeps the exhibition
 (show) controller runnable **without** the research controller.
 
-Consumed as a Poetry **path dependency** by sibling repos under `/x/coding/01-zkm/vmctl/`:
+Consumed as a Poetry **path dependency** by sibling repos under `<workspace>/vmctl/`:
 
 ```toml
 [tool.poetry.dependencies]

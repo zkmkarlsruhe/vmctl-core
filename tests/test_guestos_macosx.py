@@ -9,6 +9,7 @@ with a fake GuestContext, exactly as the module contract intends.
 
 from __future__ import annotations
 
+from vmctl_core.agentwire import Reply
 from vmctl_core.catalog import BaseImage
 from vmctl_core.guestos.capabilities import Capabilities, Capability, gate_by_agent
 from vmctl_core.guestos.modules import MacOS9Module, MacOSXModule
@@ -27,16 +28,13 @@ class FakeContext:
         self._stdout = stdout
         self._exit = exit_code
 
-    def guest_call(self, tool: str, *, timeout: float = 30.0, **args) -> dict:
+    def guest_call(self, tool: str, *, timeout: float = 30.0, **args) -> Reply:
         self.calls.append((tool, args))
-        return {
-            "result": {
-                "exit_code": self._exit,
-                "timed_out": False,
-                "stdout": self._stdout,
-                "stderr": "",
-            }
-        }
+        return Reply(
+            {"exit": str(self._exit), "stdout": self._stdout, "stderr": "", "truncated": "0"},
+            "-",
+            None,
+        )
 
     def guest_write_file(self, path: str, data: bytes) -> None:
         self.written.append((path, data))
@@ -125,14 +123,14 @@ def test_read_logs_parses_run_shell_stdout():
     assert [r.message for r in recs] == ["line one", "line two"]
     tool, args = ctx.calls[0]
     assert tool == "run_shell"
-    assert "/var/log/system.log" in args["command"] and "tail -n 10" in args["command"]
+    assert "/var/log/system.log" in args["cmd"] and "tail -n 10" in args["cmd"]
 
 
 def test_configure_proxy_issues_networksetup():
     ctx = FakeContext()
     out = MacOSXModule().configure_proxy(ctx, addr="10.0.0.1:8080", bypass="localhost,*.local")
     assert out["ok"] and out["addr"] == "10.0.0.1:8080"
-    cmd = ctx.calls[0][1]["command"]
+    cmd = ctx.calls[0][1]["cmd"]
     assert 'networksetup -setwebproxy "Ethernet" 10.0.0.1 8080' in cmd
     assert 'setsecurewebproxy "Ethernet" 10.0.0.1 8080' in cmd
     assert "setwebproxystate" in cmd and "setproxybypassdomains" in cmd
@@ -143,7 +141,12 @@ def test_install_ca_writes_pem_and_trusts_it():
     out = MacOSXModule().install_ca(ctx, cert_pem=b"-----BEGIN CERTIFICATE-----\nx\n", profile=None)
     assert out["ok"] and out["store"] == "System.keychain"
     assert ctx.written and ctx.written[0][0] == "/tmp/rvmc_ca.pem"
-    assert "security add-trusted-cert" in ctx.calls[0][1]["command"]
+    cmd = ctx.calls[0][1]["cmd"]
+    # non-root agent: through the golden's NOPASSWD sudoers line, exact argv
+    assert (
+        '[ "$(id -u)" = 0 ] || S="sudo -n"; $S /usr/bin/security add-trusted-cert -d -r trustRoot '
+        "-k /Library/Keychains/System.keychain /tmp/rvmc_ca.pem"
+    ) in cmd
 
 
 def test_make_golden_steps_flag_the_gotchas():
@@ -151,3 +154,23 @@ def test_make_golden_steps_flag_the_gotchas():
     assert "OpenPartitionDxe" in steps  # APM DVD scan fix
     assert "NetworkInterfaces.plist" in steps  # network generalize (sysprep-equiv)
     assert "isa-applesmc" in steps
+
+
+def test_tiger_install_ca_uses_certtool_into_x509anchors():
+    """10.4 has no `security add-trusted-cert`; anchors go into X509Anchors via certtool, and a
+    re-run skips an anchor that is already there (certtool fails on a duplicate)."""
+    from vmctl_core.guestos.modules.mac_os_x import MacOSXTigerModule
+
+    ctx = FakeContext(stdout="present\n")
+    pem = b"-----BEGIN CERTIFICATE-----\nAAEC\nAwQF\n-----END CERTIFICATE-----\n"
+    out = MacOSXTigerModule().install_ca(ctx, cert_pem=pem, profile=None)
+    assert out["ok"] and out["store"] == "X509Anchors"
+    assert ctx.written == [("/tmp/rvmc_ca.pem", pem)]
+    cmd = ctx.calls[0][1]["cmd"]
+    assert "certtool i /tmp/rvmc_ca.pem k=/System/Library/Keychains/X509Anchors" in cmd
+    assert "grep -qF 'AAECAwQF'" in cmd
+    assert "add-trusted-cert" not in cmd
+    # Tiger's curl reads its own bundle, not the keychain: append once, guarded by a marker
+    b = "/usr/share/curl/curl-ca-bundle.crt"
+    assert f"[ -f {b} ] && ! grep -qF '# vmctl-ca " in cmd
+    assert f"cat /tmp/rvmc_ca.pem; }} >> {b}" in cmd

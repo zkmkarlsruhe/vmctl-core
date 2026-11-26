@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Mon, 2 Nov 2026 14:12:57 +0100
+Subject: [PATCH 16/16] accel/tcg: skip clean mmu indexes when flushing a page
+
+tlb_flush_page() flushes the page in every mmu_idx. Since NB_MMU_MODES is
+the same for all targets (22), a target that uses a few indexes walks
+the main entry and the victim TLB of all the unused ones on every page
+flush. Mac OS 9 issues tlbie continuously when idle: on qemu-system-ppc
+the page flush took 73% of the host CPU samples of an idle guest.
+
+An index that got no entry since its last full flush (tlb.c.dirty clear)
+holds nothing to flush; tlb_flush_by_mmuidx already relies on the same
+bitmap. Restrict the page flush to the dirty indexes.
+---
+ accel/tcg/cputlb.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index dc83f3bad..8653d319e 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -539,8 +539,15 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
+     tlb_debug("page addr: %016" VADDR_PRIx " mmu_map:0x%x\n", addr, idxmap);
+ 
+     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+-    for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
+-        if ((idxmap >> mmu_idx) & 1) {
++    /*
++     * A mmu_idx that got no entry since its last full flush holds nothing
++     * to flush (main table, victim TLB and large page range are all reset).
++     * Skipping those matters since NB_MMU_MODES is the same for all targets:
++     * a guest that issues many tlbie otherwise walks every unused index.
++     */
++    idxmap &= cpu->neg.tlb.c.dirty;
++    for (mmu_idx = 0; idxmap; mmu_idx++, idxmap >>= 1) {
++        if (idxmap & 1) {
+             tlb_flush_page_locked(cpu, mmu_idx, addr);
+         }
+     }

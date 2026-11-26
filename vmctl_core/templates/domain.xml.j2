@@ -2,8 +2,8 @@
 {# ---- PowerPC / mac99 (Mac OS 9, screamer-audio fork) ----------------------- #}
 {# TCG (no KVM on x86 host for ppc), OpenBIOS (no Mac ROM), <1024 MB RAM. mac99   #}
 {# uses an onboard macio-IDE + sungem NIC + std VGA that libvirt CANNOT express,   #}
-{# so disks/CD/boot-order/NIC/VGA/input + the load-bearing prom-env + screamer     #}
-{# -audiodev ALL ride in <qemu:commandline> (research/33b, research/38).           #}
+{# so disks/CD/boot-order/NIC/VGA/input + the load-bearing prom-env ride in         #}
+{# <qemu:commandline> (research/33b, research/38); the audiodev is a libvirt <audio>. #}
 {#                                                                                  #}
 {# NIC — the load-bearing detail (PROVEN 2026-06-22 on rvmc-ck1/2/3 + the golden): #}
 {# a managed <interface model='sungem'> is WRONG. libvirt always lands a managed   #}
@@ -11,10 +11,11 @@
 {# there → the NIC never appears → no DHCP. The working form is a RAW cmdline NIC  #}
 {# with NO bus/addr: qemu then auto-places sungem on pci.2 (the uni-north main bus #}
 {# where macio lives), exactly where OS 9 binds "Ethernet (built-in)". The tap is  #}
-{# a per-instance device ({{ tap }}) created on virbr0 by clone.py BEFORE define,   #}
+{# a per-instance device ({{ tap }}) created by clone.py BEFORE define on the     #}
+{# project bridge (rvmc-p<idx>0; virbr0 without per-project nets), isolated port, #}
 {# owned by the qemu user (qemu.conf namespaces=[] + /dev/net/tun in              #}
 {# cgroup_device_acl). domifaddr CANNOT see a qemu:commandline NIC, so guest_ip()  #}
-{# discovers the lease by parsing dnsmasq/virbr0.status by MAC (libvirt_backend).  #}
+{# discovers the lease by parsing dnsmasq/<tap bridge>.status by MAC (backend).  #}
 <domain type='qemu' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
   <name>{{ name }}</name>
   <uuid>{{ uuid }}</uuid>
@@ -36,6 +37,17 @@
        can't bind. The NIC is a raw -netdev tap / -device sungem in <qemu:commandline>
        (no bus → qemu auto-places it on pci.2 where OS 9 finds it). See header. #}
     <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    {# The ONLY audiodev (id audio1): libvirt emits -audiodev for it, and the onboard      #}
+    {# screamer is bound to it by name (-global screamer.audiodev=audio1 below; QEMU >= 8.2 #}
+    {# no longer falls back to the first audiodev). pa plays into the per-VM null sink via  #}
+    {# pipewire-pulse.                                                                      #}
+{%- if hw.audio_sink %}
+    <audio id='1' type='pulseaudio' serverName='{{ pulse_server }}'>
+      <output name='{{ hw.audio_sink }}'/>
+    </audio>
+{%- else %}
+    <audio id='1' type='none'/>
+{%- endif %}
     <video>
       <model type='none'/>
     </video>
@@ -50,6 +62,10 @@
     {# hw.prom_env (use-nvramrc?=true + nvramrc=<blob>) — no template change needed.   #}
     <qemu:arg value='-machine'/>
     <qemu:arg value='via={{ hw.via }}'/>
+    {# the machine creates the screamer itself; name its audiodev (QEMU 11 exits with "no  #}
+    {# default audio driver available" otherwise, the 7.2 fork accepts it as well)          #}
+    <qemu:arg value='-global'/>
+    <qemu:arg value='screamer.audiodev=audio1'/>
     <qemu:arg value='-cpu'/>
     <qemu:arg value='{{ hw.cpu_model or 'g4' }}'/>
     <qemu:arg value='-boot'/>
@@ -63,34 +79,35 @@
        binds "Ethernet (built-in)" and pulls a DHCP lease. The {{ tap }} tap is created
        on virbr0 by clone.py (owned by the qemu user) BEFORE this domain is defined;
        script=no/downscript=no so qemu neither (re)creates nor tears down the tap. #}
+    {# Explicit OHCI, NOT -usb: libvirt passes -machine usb=off, and -usb re-enables the #}
+    {# mac99 machine's own OHCI, which under via=pmu (no ADB) also auto-adds usb-kbd + a #}
+    {# RELATIVE usb-mouse. Both pointers then race for the active input slot (each grabs #}
+    {# it on its first guest poll); when the mouse wins, VNC absolute clicks are dropped #}
+    {# until `mouse_set`. Same slot the machine OHCI had (pci.2 0d.0), listed BEFORE the #}
+    {# auto-slotted sungem/VGA so they keep 0e/0f. HID devices pinned to ohci.0, not to #}
+    {# libvirt's implicit (unused) piix3-uhci usb.0 on pci.0.                            #}
+    <qemu:arg value='-device'/>
+    <qemu:arg value='pci-ohci,id=ohci,bus=pci.2,addr=0xd'/>
     <qemu:arg value='-netdev'/>
     <qemu:arg value='tap,id=net0,ifname={{ tap }},script=no,downscript=no'/>
     <qemu:arg value='-device'/>
     <qemu:arg value='sungem,netdev=net0,mac={{ mac }}'/>
     <qemu:arg value='-device'/>
     <qemu:arg value='VGA'/>
-    <qemu:arg value='-usb'/>
     <qemu:arg value='-device'/>
 {%- if hw.usb_tablet %}
     {# absolute pointer — OS 9 drives it via the nvramrc/INIT tablet driver (research/48) #}
-    <qemu:arg value='usb-tablet'/>
+    <qemu:arg value='usb-tablet,bus=ohci.0'/>
 {%- else %}
-    <qemu:arg value='usb-mouse'/>
+    <qemu:arg value='usb-mouse,bus=ohci.0'/>
 {%- endif %}
     <qemu:arg value='-device'/>
-    <qemu:arg value='usb-kbd'/>
+    <qemu:arg value='usb-kbd,bus=ohci.0'/>
     <qemu:arg value='-drive'/>
     <qemu:arg value='file={{ disk_path }},format=qcow2,media=disk,index=0'/>
 {%- if boot_iso %}
     <qemu:arg value='-drive'/>
     <qemu:arg value='file={{ boot_iso }},format=raw,media=cdrom,index=2'/>
-{%- endif %}
-    <qemu:arg value='-audiodev'/>
-{%- if hw.audio_sink %}
-    <qemu:arg value='pa,id=audio1,server={{ pulse_server }},out.name={{ hw.audio_sink }},out.frequency=44100'/>
-{%- else %}
-    {# screamer is auto-added by mac99 + needs an explicit audiodev (default is rejected) #}
-    <qemu:arg value='none,id=audio1'/>
 {%- endif %}
   </qemu:commandline>
 </domain>
@@ -141,7 +158,7 @@
        right after OpenCore hands off to boot.efi (no kernel output) — the symptom
        misread as an "AMD kernel wall". Collapsing every vcpu into ONE socket makes
        Snow Leopard 10.6 boot to the desktop under KVM on an AMD/EPYC host (verified
-       2026-07-30, vmctl-lab EPYC). All cores in one socket, no SMT. #}
+       2026-07-30, lab host EPYC). All cores in one socket, no SMT. #}
     <topology sockets='1' cores='{{ hw.vcpus }}' threads='1'/>
   </cpu>
   <clock offset='{{ hw.clock }}'/>
@@ -215,7 +232,7 @@
        in CPUID leaf 0 and macOS refuses to boot (hangs at boot.efi, no kernel
        output). qemu takes the LAST -cpu, so this trailing override forces the real
        Intel vendor string + the model/features; the <cpu> element above still drives
-       the single-socket -smp topology. Verified with the topology fix on vmctl-lab
+       the single-socket -smp topology. Verified with the topology fix on the lab host
        (EPYC) 2026-07-30 — both are required to boot Snow Leopard under KVM on AMD. #}
     <qemu:arg value='-cpu'/>
     <qemu:arg value='{{ hw.cpu_model or "Penryn" }},vendor=GenuineIntel{% for f in hw.cpu_features %},+{{ f }}{% endfor %}'/>
@@ -303,36 +320,6 @@
       <source network='{{ network }}'/>
       <model type='{{ hw.nic_model }}'/>
     </interface>
-{%- if hw.control_nic_enabled %}
-    {#- ADDITIONAL isolated host-only CONTROL/management NIC. Two roles, one emit:
-        (a) legacy-TCP containment (research/68) — guests with NO virtio-serial
-            (win2000/win98/irix) run the agentbox on TCP:9009; without this that
-            listener would sit on the NIC above, the same NAT network the untrusted
-            artwork uses. hw.mgmt_nic selects this role.
-        (b) P3 dual-pipeline FALLBACK — a VIRTIO-SERIAL golden that ALSO sets this
-            (hw.control_nic / hw.mgmt_nic) stays dual-homed: vioser primary + this
-            control NIC carrying TCP-over-control-NIC that survives a vioser-driver
-            wedge. The artwork NIC + vioser channels + qemu-ga above are all unchanged.
-        This interface lives on the isolated 'rvmc-mgmt' libvirt network (no <forward>,
-        private 10.77.0.0/24 + DHCP — see deploy/networks/rvmc-mgmt.xml), so :9009 on it
-        is unreachable from the artwork/exhibition LAN. No <mac>: libvirt auto-assigns.
-        control_ip() prefers the 10.77.0.x lease so the controller/tcp_helper dial it.
-        MODEL — control_nic_model_effective: e1000 on a vioser golden, a driver
-        INDEPENDENT of the virtio-serial that may wedge (that independence is the whole
-        point of the fallback); nic_model on a legacy-TCP base, so those domains stay
-        byte-for-byte identical. The primary NIC above is unchanged (artwork path); this
-        whole block is skipped when neither flag is set, so single-NIC domains stay
-        byte-for-byte identical too.
-        GUEST-SIDE CAVEAT (NOT emitted here — golden-build / bootstrap workstream): the
-        guest MUST set interface metrics so this isolated control NIC (10.77/24, no
-        gateway/forward) NEVER becomes the default route (the codex NIC-ordering trap).
-        Artwork egress has to stay on the artwork NIC — otherwise the guest black-holes
-        outbound traffic at the no-forward mgmt network. -#}
-    <interface type='network'>
-      <source network='rvmc-mgmt'/>
-      <model type='{{ hw.control_nic_model_effective }}'/>
-    </interface>
-{%- endif %}
     <serial type='pty'>
       <target type='isa-serial' port='0'/>
     </serial>

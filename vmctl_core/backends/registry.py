@@ -14,19 +14,24 @@ from ..catalog import BaseImage
 from .base import VMBackend
 from .libvirt_backend import LibvirtBackend
 from .mac_emu import BasiliskIIBackend, MacEmuSettings, SheepShaverBackend
+from .process import ProcessBackend
+from .qemu_q800 import Q800Backend
 
 # valid explicit hw.backend values
 LIBVIRT = "libvirt"
 SHEEPSHAVER = "sheepshaver"
 BASILISK2 = "basilisk2"
+Q800 = "q800"  # qemu-system-m68k -M q800 as a process (QMP + VNC), research/70c
+PROCESS = "process"  # any emulator run from one command line, defined by process.json
 _MAC_KINDS = (SHEEPSHAVER, BASILISK2)
+_PROCESS_KINDS = (*_MAC_KINDS, Q800, PROCESS)
 
 
 def resolve_backend_kind(base: BaseImage) -> str:
     """The backend kind for a base. Explicit ``hw.backend`` wins; otherwise inferred
     conservatively so nothing existing changes:
 
-    * ``m68k``/``68k`` arch (no such base today) -> ``basilisk2``
+    * ``m68k``/``68k`` arch -> ``q800`` when ``machine: q800``, else ``basilisk2``
     * everything else (incl. arch ``ppc`` = the libvirt mac9 tier) -> ``libvirt``
 
     Note: arch ``ppc`` does NOT infer sheepshaver — the shipped mac9 golden runs
@@ -35,20 +40,25 @@ def resolve_backend_kind(base: BaseImage) -> str:
     """
     kind = (getattr(base.hw, "backend", "") or "").strip().lower()
     if kind:
-        if kind not in (LIBVIRT, *_MAC_KINDS):
+        if kind not in (LIBVIRT, *_PROCESS_KINDS):
             raise ValueError(
                 f"base {base.id!r}: unknown hw.backend {kind!r} "
-                f"(expected one of {LIBVIRT!r}, {SHEEPSHAVER!r}, {BASILISK2!r})"
+                f"(expected one of {LIBVIRT!r}, {SHEEPSHAVER!r}, {BASILISK2!r}, {Q800!r}, {PROCESS!r})"
             )
         return kind
     if (base.hw.arch or "").strip().lower() in ("m68k", "68k"):
-        return BASILISK2
+        return Q800 if (base.hw.machine or "").strip().lower() == "q800" else BASILISK2
     return LIBVIRT
 
 
 def is_mac_emu(base: BaseImage) -> bool:
-    """True for a SheepShaver/Basilisk base (a process backend, not libvirt)."""
+    """True for a SheepShaver/Basilisk base (the Xvfb/x11vnc process backend)."""
     return resolve_backend_kind(base) in _MAC_KINDS
+
+
+def is_process_backend(base: BaseImage) -> bool:
+    """True for every non-libvirt base (SheepShaver, Basilisk II, q800)."""
+    return resolve_backend_kind(base) in _PROCESS_KINDS
 
 
 def backend_for(
@@ -77,6 +87,18 @@ def backend_for(
     kind = resolve_backend_kind(base)
     if kind == LIBVIRT:
         return LibvirtBackend(name, uri=libvirt_uri)
+    if kind == Q800:
+        # q800 keeps its whole definition in instance_dir (written by clone_q800 + define)
+        if not str(instance_dir or "").strip():
+            raise ValueError(f"q800 backend for {name!r} requires instance_dir")
+        return Q800Backend(
+            name, instance_dir=str(instance_dir), settings=mac_settings or MacEmuSettings()
+        )
+
+    if kind == PROCESS:
+        if not str(instance_dir or "").strip():
+            raise ValueError(f"process backend for {name!r} requires instance_dir")
+        return ProcessBackend(name, instance_dir=str(instance_dir))
 
     if not str(disk or "").strip():
         raise ValueError(f"{kind} backend for {name!r} requires an instance disk (.dsk)")

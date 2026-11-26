@@ -1,11 +1,8 @@
 """Mac OS X (Intel) module — Snow Leopard 10.6 and neighbours.
 
-The modern counterpart to :class:`MacOS9Module`. Where OS 9 is classic PPC with a
-faceless MacPython HTTP agent, 10.6 is a full BSD/Darwin Unix: it runs the
-``guest-agent/snowleopard`` agent (Python 2.6.1) speaking newline-delimited
-JSON-RPC over **TCP:9009** on the libvirt NAT — the legacy-TCP tier, same wire as
-the mainline agent, driven through ``rvmc/tcp_helper.py`` (no vioser: macOS has no
-virtio driver). So unlike the Windows-shaped behaviours, everything here is plain
+The modern counterpart to :class:`MacOS9Module`. OS 9 is classic PPC with a
+faceless MacPython VA1 agent; 10.6 is a full BSD/Darwin Unix. Its agent speaks VA1
+over TCP 9009 on the libvirt NAT (macOS has no virtio driver). Everything here is
 Unix run through the agent's ``run_shell`` tool:
 
 * logs      -> ``/var/log/system.log`` / the agent log (READ_LOGS)
@@ -36,6 +33,8 @@ universal DATALINK_MOUNT + MAKE_GOLDEN, exactly like the OS 9 stub degrades.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from ..capabilities import Capabilities, Capability
 from ..contract import BaseGuestOSModule, CertProfile, LogRecord
@@ -75,17 +74,13 @@ class MacOSXModule(BaseGuestOSModule):
         )
 
     def agent_transport(self, ctx) -> str:
-        # Legacy-TCP: the snowleopard agent listens on :9009 (NDJSON JSON-RPC) on the
-        # libvirt NAT; the controller reaches it through tcp_helper.py. NOT vioser.
+        # VA1 TCP :9009 on the libvirt NAT; macOS has no vioser driver.
         return "tcp"
 
     # --- helpers ------------------------------------------------------------
     def _sh(self, ctx, command: str, *, timeout: float = 30.0) -> dict:
-        """Run one shell command through the agent's run_shell tool. Returns the
-        inner result {exit_code, timed_out, stdout, stderr} (or {} if unwrapped
-        oddly). ctx.guest_call wraps the tool result under "result"."""
-        res = ctx.guest_call("run_shell", command=command, timeout=timeout).get("result")
-        return res if isinstance(res, dict) else {}
+        """Return decoded VA1 run_shell kv (exit, stdout, stderr, truncated)."""
+        return ctx.guest_call("run_shell", cmd=command, timeout=timeout).kv
 
     # --- logs ---------------------------------------------------------------
     def read_logs(self, ctx, *, kind: str = "system", count: int = 50) -> list[LogRecord]:
@@ -124,19 +119,25 @@ class MacOSXModule(BaseGuestOSModule):
         accepted for contract parity but has no separate store on 10.6 (Safari = system
         keychain); a bundled Firefox NSS store is out of scope (INSTALL_CA_BROWSER off)."""
         guest_path = "/tmp/rvmc_ca.pem"
+        # The 10.6 agent runs as `vmctl` (uid 501, a GUI LaunchAgent): the admin trust store
+        # needs root ("SecCertificateAddToKeychain: Could not write to the file"). The golden
+        # grants exactly this command line NOPASSWD in /etc/sudoers (vmctl-guest-agent
+        # hygiene/README.md); `sudo -n` fails fast where that line is missing. Re-adding a
+        # trusted root exits 0, so the call is idempotent.
         try:
             ctx.guest_write_file(guest_path, cert_pem)
             res = self._sh(
                 ctx,
-                "security add-trusted-cert -d -r trustRoot "
+                'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+                "$S /usr/bin/security add-trusted-cert -d -r trustRoot "
                 f"-k /Library/Keychains/System.keychain {guest_path}",
                 timeout=60.0,
             )
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {
-            "ok": res.get("exit_code") == 0,
-            "exit_code": res.get("exit_code"),
+            "ok": res.get("exit") == "0",
+            "exit_code": int(res["exit"]),
             "stderr": res.get("stderr", ""),
             "store": "System.keychain",
         }
@@ -160,7 +161,7 @@ class MacOSXModule(BaseGuestOSModule):
             res = self._sh(ctx, " && ".join(cmds))
         except Exception as e:
             return {"ok": False, "error": str(e)}
-        return {"ok": res.get("exit_code") == 0, "addr": f"{host}:{port}", "service": _NET_SERVICE}
+        return {"ok": res.get("exit") == "0", "addr": f"{host}:{port}", "service": _NET_SERVICE}
 
     def clear_proxy(self, ctx) -> dict:
         cmds = [
@@ -171,7 +172,7 @@ class MacOSXModule(BaseGuestOSModule):
             res = self._sh(ctx, " && ".join(cmds))
         except Exception as e:
             return {"ok": False, "error": str(e)}
-        return {"ok": res.get("exit_code") == 0, "service": _NET_SERVICE}
+        return {"ok": res.get("exit") == "0", "service": _NET_SERVICE}
 
     # --- dialogs / audio / datalink ----------------------------------------
     def handle_dialogs(self, ctx, *, kind="security_warning") -> dict:
@@ -183,7 +184,7 @@ class MacOSXModule(BaseGuestOSModule):
             res = self._sh(ctx, f"osascript -e '{script}'")
         except Exception as e:
             return {"ok": False, "error": str(e), "kind": kind}
-        return {"ok": res.get("exit_code") == 0, "kind": kind, "action": "press-default"}
+        return {"ok": res.get("exit") == "0", "kind": kind, "action": "press-default"}
 
     def audio_setup(self, ctx) -> dict:
         """Unmute + raise the guest output volume (host sink wiring is the backend's job)."""
@@ -192,7 +193,7 @@ class MacOSXModule(BaseGuestOSModule):
             res = self._sh(ctx, f"osascript -e '{script}'")
         except Exception as e:
             return {"ok": False, "error": str(e)}
-        return {"ok": res.get("exit_code") == 0}
+        return {"ok": res.get("exit") == "0"}
 
     def datalink_mount(self, ctx) -> dict:
         """The universal host->guest CD is inserted by the backend (ctx.insert_cd) and
@@ -227,3 +228,54 @@ class MacOSXModule(BaseGuestOSModule):
             "hard-poweroff (clean shutdown panics in IOGraphicsFamily/vmware-svga; the HFS+ "
             "journal recovers on next boot)",
         ]
+
+
+class MacOSXTigerModule(MacOSXModule):
+    """Mac OS X 10.4 Tiger on ppc/mac99 (the osx-tiger golden). Same agent contract and
+    behaviours as 10.6; only the label differs. Without it "mac-os-x-tiger" resolved to
+    the Intel module by its "mac-os-x" prefix and the UI called a PowerPC guest Intel."""
+
+    os_labels: tuple[str, ...] = ("mac-os-x-tiger", "osx-tiger", "tiger")
+    display_name = "Mac OS X Tiger (PowerPC)"
+    # 10.4.11's HID stack maps the usb-tablet range onto ~1.178x the 800x600 screen,
+    # centred, then pins to the screen (measured 2026-10-13: raw QMP abs x=8192/24576
+    # -> GetGlobalMouse 164/635, ideal 200/600; tracking speed has no effect; QEMU
+    # VNC/HID deliver the exact raw values). Mac OS 9 on the same tablet is 1:1.
+    abs_pointer_gain = 1.178
+
+    def install_ca(self, ctx, *, cert_pem, profile, browser=True) -> dict:
+        """10.4 has no ``security add-trusted-cert`` (10.5+). Its trust anchors are the
+        X509Anchors keychain, which ``certtool i`` imports into; the Tiger agent is a root
+        LaunchDaemon, so it may write there. ``certtool`` fails on a duplicate, so an anchor
+        that is already present (same base64 body) is skipped.
+
+        The system curl (7.16.3, OpenSSL 0.9.7l) ignores the keychain and verifies against
+        its own ``/usr/share/curl/curl-ca-bundle.crt``, so the PEM is also appended there,
+        once: a marker line carrying a hash of the PEM bodies guards the append."""
+        guest_path = "/tmp/rvmc_ca.pem"
+        anchors = "/System/Library/Keychains/X509Anchors"
+        bundle = "/usr/share/curl/curl-ca-bundle.crt"
+        text = cert_pem.decode("ascii", "replace")
+        body = "".join(ln for ln in text.splitlines() if ln and not ln.startswith("-----"))
+        marker = "# vmctl-ca " + hashlib.sha256(body.encode()).hexdigest()[:16]
+        try:
+            ctx.guest_write_file(guest_path, cert_pem)
+            res = self._sh(
+                ctx,
+                f"if security find-certificate -a -p {anchors} | tr -d '\\n' "
+                f"| grep -qF '{body}'; then echo present; "
+                f"else certtool i {guest_path} k={anchors}; fi && "
+                f"if [ -f {bundle} ] && ! grep -qF '{marker}' {bundle}; then "
+                f"{{ echo; echo '{marker}'; cat {guest_path}; }} >> {bundle} "
+                "&& echo 'curl bundle: appended'; fi",
+                timeout=60.0,
+            )
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {
+            "ok": res.get("exit") == "0",
+            "exit_code": int(res["exit"]),
+            "stdout": (res.get("stdout") or "").strip()[-200:],
+            "stderr": res.get("stderr", ""),
+            "store": "X509Anchors",
+        }

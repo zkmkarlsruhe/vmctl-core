@@ -10,6 +10,7 @@ Each test pins one HIGH-severity defect so a re-introduction fails loudly:
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import subprocess
 import types
@@ -20,6 +21,7 @@ import pytest
 
 import vmctl_core.clone as clone_mod
 from vmctl_core import capture, promotion
+from vmctl_core.backends.base import BackendError
 from vmctl_core.backends.libvirt_backend import LibvirtBackend
 from vmctl_core.clone import CloneError, create_ppc_tap
 from vmctl_core.plugins import PluginRegistry, load_plugins
@@ -46,7 +48,7 @@ def test_capture_bpf_exclude_is_positional_and_shell_safe(tmp_path, monkeypatch)
 
     monkeypatch.setattr(capture.subprocess, "Popen", fake_popen)
     mon = capture.NetworkMonitor(tmp_path)
-    mon.start("iid1", "tap0", exclude="tcp port 9610")
+    mon.start("iid1", "tap0", exclude="tcp port 9009")
     monkeypatch.undo()  # restore the real subprocess.Popen for the sh -n check below
 
     argv = captured["argv"]
@@ -57,7 +59,7 @@ def test_capture_bpf_exclude_is_positional_and_shell_safe(tmp_path, monkeypatch)
     # be `not ( ... )` — a leading `and` would be a binary op with no left operand and
     # fail libpcap pcap_compile.
     bpf = argv[6]
-    assert bpf == "not ( tcp port 9610 )"
+    assert bpf == "not ( tcp port 9009 )"
 
     # the grouping parens must NOT be spliced into the script text (that was the first
     # bug: `sh -c` parsed `( ... )` as a subshell -> 'Syntax error: "(" unexpected').
@@ -129,6 +131,32 @@ def test_stop_kills_recorded_pid_via_sudo_and_clears_pidfile(tmp_path, monkeypat
     assert not pidfile.exists()  # proc.wait proved it dead -> pidfile cleared
 
 
+def test_stale_pidfile_is_not_capturing_and_never_killed(tmp_path, monkeypatch):
+    """After a reboot the pidfile's number may belong to an unrelated process: only a
+    pid whose argv carries ``-w <pcap>`` counts as our capture."""
+    mon = capture.NetworkMonitor(tmp_path)
+    iid = "c3"
+    pidfile = mon._pidfile(iid)
+    pcap = mon.pcap_path(iid)
+    live = subprocess.Popen(["sh", "-c", "sleep 30", "sh", "-w", str(pcap)])
+    try:
+        pidfile.write_text(f"{live.pid}\n")
+        assert mon.is_capturing(iid)
+    finally:
+        live.kill()
+        live.wait()
+    pidfile.write_text(f"{os.getpid()}\n")  # alive, but not a tcpdump for this pcap
+    assert not mon.is_capturing(iid)
+    assert not pidfile.exists()
+    # stop() on the reconcile path (no Popen handle) must not sudo-kill the stranger
+    pidfile.write_text(f"{os.getpid()}\n")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(capture.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _ns(0))
+    mon.stop(iid)
+    assert calls == []
+    assert not pidfile.exists()
+
+
 def test_stop_keeps_pidfile_when_tcpdump_survives_the_kill(tmp_path, monkeypatch):
     mon = capture.NetworkMonitor(tmp_path)
     iid = "c2"
@@ -143,6 +171,45 @@ def test_stop_keeps_pidfile_when_tcpdump_survives_the_kill(tmp_path, monkeypatch
     # double-write the pcap
     assert pidfile.exists()
     assert mon.is_capturing(iid)
+
+
+# --- snapshot overwrite: delete only the one name, never its children ---------
+def test_snapshot_create_overwrite_keeps_children(monkeypatch):
+    b = LibvirtBackend("d")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_virsh(*a, **k):
+        calls.append(a)
+        if a[0] == "snapshot-list":
+            return _ns(0, stdout="ready\nstep1\n")
+        if a[0] == "dumpxml":
+            return _ns(0, stdout="<domain><os><type arch='x86_64'>hvm</type></os></domain>")
+        return _ns(0)
+
+    b._virsh = fake_virsh  # type: ignore[method-assign]
+    b.snapshot_create("ready")
+    assert ("snapshot-delete", "d", "ready") in calls
+    assert ("snapshot-create-as", "d", "ready", "--atomic") in calls
+    assert not any("--children" in a for a in calls)
+
+
+def test_snapshot_create_disk_only_on_running_domain_is_refused():
+    """`--disk-only` on a running domain makes an EXTERNAL snapshot nobody tracks."""
+    b = LibvirtBackend("d")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_virsh(*a, **k):
+        calls.append(a)
+        if a[0] == "snapshot-list":
+            return _ns(0, stdout="")
+        if a[0] == "domstate":
+            return _ns(0, stdout="running\n")
+        return _ns(0, stdout="<domain><os><type arch='x86_64'>hvm</type></os></domain>")
+
+    b._virsh = fake_virsh  # type: ignore[method-assign]
+    with pytest.raises(BackendError, match="always includes RAM"):
+        b.snapshot_create("x", memory=False)
+    assert not any(a[0] == "snapshot-create-as" for a in calls)
 
 
 # --- bug 2: undefine() keeps the tap when virsh undefine failed ----------------
@@ -170,7 +237,7 @@ def test_create_ppc_tap_cleans_up_on_partial_failure(monkeypatch):
 
     def fake_run(cmd):
         calls.append(cmd)
-        if cmd[:4] == ["ip", "-o", "link", "show"]:
+        if cmd[:5] == ["ip", "-d", "-o", "link", "show"]:
             return _ns(1)  # _tap_ready probe: not ready
         if cmd[:3] == ["ip", "link", "show"]:
             return _ns(1)  # bare existence probe: not present
@@ -192,9 +259,10 @@ def test_create_ppc_tap_noop_only_when_up_and_enslaved(monkeypatch):
 
     def fake_run(cmd):
         calls.append(cmd)
-        if cmd[:4] == ["ip", "-o", "link", "show"]:
+        if cmd[:5] == ["ip", "-d", "-o", "link", "show"]:
             return _ns(
-                0, stdout="9: os9x: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master virbr0"
+                0,
+                stdout="9: os9x: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master virbr0 state UP bridge_slave isolated on",
             )
         return _ns(0)
 
@@ -210,14 +278,16 @@ def test_create_ppc_tap_recreates_a_present_but_down_tap(monkeypatch):
 
     def fake_run(cmd):
         calls.append(cmd)
-        if cmd[:4] == ["ip", "-o", "link", "show"]:
+        if cmd[:5] == ["ip", "-d", "-o", "link", "show"]:
             # down/unbridged until enslave completes
             if state["ready"]:
-                return _ns(0, stdout="9: os9y: <UP,LOWER_UP> master virbr0")
+                return _ns(
+                    0, stdout="9: os9y: <UP,LOWER_UP> master virbr0 bridge_slave isolated on"
+                )
             return _ns(0, stdout="9: os9y: <BROADCAST,MULTICAST> mtu 1500 state DOWN")
         if cmd[:3] == ["ip", "link", "show"]:
             return _ns(0)  # present
-        if "master" in cmd:
+        if "isolated" in cmd:
             state["ready"] = True
             return _ns(0)
         return _ns(0)
@@ -350,3 +420,18 @@ def test_clear_owner_is_value_aware_on_shared_dict_key():
     assert reg.get_poll_value("shared") == "B"
     reg._clear_owner("bb")  # bb's own clear DOES remove it
     assert reg.get_poll_value("shared") == "none"
+
+
+def test_capture_drops_tcpdump_privileges_to_the_controller_user(tmp_path, monkeypatch):
+    """The pcap must be owned by the controller user, not tcpdump's default drop user
+    (`tcpdump`), or purging the drive dir fails (lab host 2026-10-30)."""
+    captured: dict = {}
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(capture.subprocess, "Popen", fake_popen)
+    capture.NetworkMonitor(tmp_path).start("iid3", "tap0")
+    me = pwd.getpwuid(os.getuid()).pw_name
+    assert f"exec tcpdump -Z {me} -i tap0 " in captured["argv"][4]

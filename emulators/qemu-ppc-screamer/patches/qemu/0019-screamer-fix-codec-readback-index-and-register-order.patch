@@ -1,0 +1,60 @@
+From 11d1cd2eff58eb380219a7b80e931d9e8556c8e9 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Tue, 24 Nov 2026 23:50:24 +0100
+Subject: [PATCH 19/19] screamer: fix codec readback index and register order
+
+The readback selector was shifted after masking and could index past the
+eight codec registers; the guest driver also expects the value in bits 4-15.
+Store a codec register before applying mute and attenuation, the old order
+applied the previous value.
+---
+ hw/audio/screamer.c | 21 +++++++--------------
+ 1 file changed, 7 insertions(+), 14 deletions(-)
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index 4be501cc7..ddc1c7c59 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -344,24 +344,17 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
+ 
+ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
+ {
+-    //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
+-
+-    switch (addr) {
+-    case 0x1:
++    if (addr == 0x1) {
+         /* Clear recalibrate if set */
+-        val = val & ~CODEC_CTRL1_RECALIBRATE;    
++        val &= ~CODEC_CTRL1_RECALIBRATE;
++    }
+ 
+-        /* Update volume in case mute set */
+-        screamer_update_volume(s);
+-        break;
++    s->codec_ctrl_regs[addr] = val;
+ 
+-    case 0x4:
+-        /* Speaker attenuation */
++    /* mute and speaker attenuation */
++    if (addr == 0x1 || addr == 0x4) {
+         screamer_update_volume(s);
+-        break;
+     }
+-    
+-    s->codec_ctrl_regs[addr] = val;
+ }
+ 
+ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+@@ -380,7 +373,7 @@ static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
+     case CODEC_STAT_REG:
+         if (s->codec_ctrl_regs[7] & 1) {
+             /* Read back mode */
+-            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] >> 1) & 0xe];
++            val = s->codec_ctrl_regs[(s->codec_ctrl_regs[7] & 0xe) >> 1] << 4;
+         } else {
+             /* Return status register */
+             val = s->regs[addr] & ~0xff00;
+-- 
+2.43.0
+

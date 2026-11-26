@@ -1,0 +1,35 @@
+# vmctl emulator image for goldens built on Debian 13's stock QEMU (q800 golden v1, research/70e):
+# qemu-system-m68k + qemu-img 1:10.0.13+ds-0+deb13u1, unpatched, exactly what that golden was
+# built and verified on. Packages come from a fixed snapshot.debian.org date, so a rebuild in
+# later years still gets the same versions (apt verifies the archive signatures).
+# socat: the backend forwards the agent port to the container's own loopback and socat bridges
+# it to the instance's agent.sock (the container has no network; see qemu_q800.build_argv).
+#
+#   docker build -f Dockerfile.debian-10.0.13 -t vmctl-emu/qemu-m68k:10.0.13-deb emulators/qemu-m68k
+
+ARG DEBIAN=debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
+FROM ${DEBIAN}
+ARG SNAPSHOT=20261004T000000Z
+ARG QEMU_DEB=1:10.0.13+ds-0+deb13u1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+    && echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${SNAPSHOT} trixie main" \
+       > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       qemu-system-misc=${QEMU_DEB} qemu-utils=${QEMU_DEB} socat \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/qemu-system-m68k /usr/local/bin/qemu-system-m68k \
+    && ln -s /usr/bin/qemu-img /usr/local/bin/qemu-img \
+    && qemu-system-m68k --version && qemu-img --version
+# same layout as the source-built image: the classicvirtio declrom for bases with a tablet
+COPY classicvirtio/declrom /usr/local/share/vmctl/classicvirtio-declrom
+COPY classicvirtio/LICENSE /usr/local/share/vmctl/classicvirtio-LICENSE
+LABEL org.opencontainers.image.title="vmctl-emu/qemu-m68k" \
+      org.opencontainers.image.version="10.0.13-deb" \
+      org.opencontainers.image.source="https://git.zkm.de/MuTech/conservation/vmctl/vmctl-core" \
+      vmctl.emulator="qemu-m68k" vmctl.qemu.version="10.0.13" \
+      vmctl.qemu.debian="qemu-system-misc ${QEMU_DEB} (snapshot.debian.org ${SNAPSHOT})"
+USER 65534:65534
+ENTRYPOINT []
+CMD ["qemu-system-m68k", "--version"]

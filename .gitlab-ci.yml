@@ -1,7 +1,9 @@
-# vmctl-core — shared library; test-only (no image, no deploy). Poetry gates:
+# vmctl-core — shared library; test-only (no app image, no deploy). Poetry gates:
 # lock-solve + ruff + format + mypy + pytest. Consumed as a path-dep by rvmc/autopsy.
+# Plus the emulator images (emulators/*, research/70j), built only when their source changes.
 stages:
   - check
+  - build
   - notify
 
 check:
@@ -9,6 +11,8 @@ check:
   image: $CI_REGISTRY/dockerhub-cache/library/python:3.14
   before_script:
     - pip install --no-cache-dir --quiet poetry==2.4.1
+    # promotion tests build real qcow2 chains; without qemu-img they are skipped
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends qemu-utils > /dev/null
   script:
     - poetry check --lock          # dependency-solve gate: a stale lock fails here
     - poetry install --no-interaction
@@ -20,13 +24,70 @@ check:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
+# Emulator images -> harbor (mutech/vmctl-emu/*). A golden pins the image ID it was built and
+# verified on (hw.emulator_image_id), and a rebuild never reproduces that ID. So: every run builds
+# (+ QEMU's m68k qtests), but only a pipeline started with EMU_PUSH=1 publishes; the golden builder
+# then pulls that published image and pins its ID. Bump VERSION (…-zkm2) for any change and keep
+# Harbor's tag-immutability rule on mutech/vmctl-emu/**. The source image runs QEMU's m68k qtests in
+# its build stage, so a passing job includes them.
+.build-emulator:
+  stage: build
+  image:
+    name: $CI_REGISTRY/mutech/kaniko-executor:debug
+    entrypoint: [""]
+  needs: []
+  variables:
+    EMU_DIR: emulators/qemu-m68k
+    IMAGE: $CI_REGISTRY/mutech/vmctl-emu/qemu-m68k
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      cat > /kaniko/.docker/config.json <<EOF
+      {"auths":{"$CI_REGISTRY":{"auth":"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_TOKEN" | base64 -w0)"}}}
+      EOF
+  script:
+    - KANIKO="/kaniko/executor --context $CI_PROJECT_DIR/$EMU_DIR --dockerfile $CI_PROJECT_DIR/$EMU_DIR/$DOCKERFILE --build-arg IMAGE_VERSION=$TAG"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] && [ "$EMU_PUSH" = 1 ]; then
+        $KANIKO --destination "$IMAGE:$TAG" --digest-file digest.txt
+        echo "$IMAGE:$TAG@$(cat digest.txt)" | tee image.txt
+      else
+        $KANIKO --no-push
+      fi
+  artifacts:
+    paths: [image.txt]
+    expire_in: 90 days
+
+# QEMU from source + vmctl patches; tag = emulators/qemu-m68k/VERSION (bump it for ANY change)
+build:emulator-qemu-m68k:
+  extends: .build-emulator
+  variables:
+    DOCKERFILE: Dockerfile
+  before_script:
+    - !reference [.build-emulator, before_script]
+    - export TAG="$(cat $EMU_DIR/VERSION)"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [emulators/qemu-m68k/Dockerfile, emulators/qemu-m68k/VERSION,
+                emulators/qemu-m68k/patches/**/*, emulators/qemu-m68k/classicvirtio/**/*]
+
+# Debian 13's stock QEMU 10.0.13 (golden v1); its own file, so it is only rebuilt when it changes
+build:emulator-qemu-m68k-deb:
+  extends: .build-emulator
+  variables:
+    DOCKERFILE: Dockerfile.debian-10.0.13
+    TAG: 10.0.13-deb
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [emulators/qemu-m68k/Dockerfile.debian-10.0.13]
+
 # On main only (post-merge, after `check` passes): tell the vmctl superproject to
 # bump its pointer to this new commit. Fires a pipeline trigger on the superproject
 # (project 1357) with the submodule path + this SHA; the superproject's auto-bump job
 # does the pointer commit. Needs SUPERPROJECT_TRIGGER_TOKEN (masked CI var).
 update-superproject:
   stage: notify
-  image: curlimages/curl:latest
+  image: curlimages/curl:latest@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:

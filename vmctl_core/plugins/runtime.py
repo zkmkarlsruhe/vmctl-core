@@ -18,12 +18,22 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from .spec import MANIFEST_FILENAME, PluginManifest
 
+if TYPE_CHECKING:  # type-only: the runtime never needs the catalog module imported
+    from ..tools import ToolsLibrary
+
 logger = logging.getLogger(__name__)
+
+#: Per-client SSE backlog cap. An exhibition browser tab that stops reading (a sleeping kiosk,
+#: a wedged frontend) would otherwise grow its queue without bound over a run of weeks. When a
+#: queue is full the OLDEST event is dropped: the newest state is what a display needs, and the
+#: memory stays bounded whether anyone reads or not.
+SSE_QUEUE_MAXSIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -93,7 +103,7 @@ class PluginRegistry:
         # so this is how a plugin reaches shared state). `tools` = the ToolsLibrary
         # catalog, so a plugin derives tool availability/gaps from the single source of
         # truth instead of hard-coding a staged-list. None when the host didn't attach it.
-        self.tools = None
+        self.tools: ToolsLibrary | None = None
 
     # --- registration -----------------------------------------------------
     #: mutable registration collections a load snapshots / rolls back (dicts key by
@@ -284,7 +294,7 @@ class PluginRegistry:
 
     # --- SSE --------------------------------------------------------------
     def sse_connect(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
         try:
             loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
@@ -306,9 +316,27 @@ class PluginRegistry:
             if loop is not None:
                 # push_event may run on a non-loop thread (handle_signal on the sync threadpool);
                 # asyncio.Queue.put_nowait must run on the loop that owns the queue, so hop onto it.
-                loop.call_soon_threadsafe(q.put_nowait, item)
+                # _offer runs there too, so the full-queue handling stays on the owning loop.
+                loop.call_soon_threadsafe(self._offer, q, item)
             else:
+                self._offer(q, item)
+
+    def _offer(self, q: asyncio.Queue, item: tuple[str, str]) -> None:
+        """Put an event on one client's bounded queue, dropping its oldest if full.
+
+        Runs on the queue's owning loop (see push_event). A laggard that never reads keeps a
+        bounded backlog of the MOST RECENT events instead of growing without limit; a client
+        whose queue cannot accept even after a drop is disconnected rather than retried forever.
+        """
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()  # drop oldest, keep the stream flowing to the latest state
                 q.put_nowait(item)
+            except Exception:
+                logger.warning("dropping unresponsive SSE client (queue full)")
+                self.sse_disconnect(q)
 
 
 @dataclass

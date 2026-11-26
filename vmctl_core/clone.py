@@ -7,6 +7,7 @@ near-zero-disk; resetting an instance to pristine = delete + recreate the overla
 
 from __future__ import annotations
 
+import getpass
 import os
 import subprocess
 import uuid as _uuid
@@ -16,6 +17,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from .atomicio import write_text_atomic
 from .catalog import BaseImage
+from .paths import safe_segment
 
 _TEMPLATES = Path(__file__).parent / "templates"
 _env = Environment(
@@ -35,12 +37,18 @@ def random_mac() -> str:
 
 # ppc/mac99 NIC is a RAW -netdev tap (research/58): a libvirt-managed <interface>
 # lands the sungem on a PCI bus OS 9 can't bind, so the tap is host-managed instead.
-# The host bridge the tap joins (virbr0 is libvirt's "default" NAT network's bridge,
-# whose dnsmasq leases the per-instance IP guest_ip() later parses).
+# The host bridge the tap joins by DEFAULT (virbr0 is libvirt's "default" NAT network's
+# bridge, whose dnsmasq leases the per-instance IP guest_ip() later parses). rvmc passes
+# the instance's project bridge (rvmc-p<idx>0) instead under per-project net isolation.
+# Either way the tap port is bridge-ISOLATED: two ppc clones of the same golden share a
+# computer name, and Bonjour between them pops a "name already in use" modal over the
+# artwork. An isolated port still reaches the host (dnsmasq, agent, poll, wbc gateway),
+# just never another isolated port, i.e. another ppc clone on the same bridge.
 PPC_TAP_BRIDGE = "virbr0"
 # The qemu user that must own the tap (qemu.conf user). On the deploy box qemu runs
 # as the deploying user (libvirt session/user-as-qemu, namespaces=[]); see deploy note.
-PPC_TAP_USER = os.environ.get("RVMC_QEMU_USER", "scharc")
+# Default: the user running the controller, never one deployment's login.
+PPC_TAP_USER = os.environ.get("RVMC_QEMU_USER") or getpass.getuser()
 # Linux IFNAMSIZ caps an interface name at 15 chars (+NUL). "os9" + 8 hex of the
 # domain/instance id = 11 chars, comfortably under the limit and per-instance unique.
 _TAP_PREFIX = "os9"
@@ -69,18 +77,20 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 def _tap_ready(tap: str, bridge: str) -> bool:
-    """True only if `tap` EXISTS, is administratively UP, and enslaved to `bridge`.
-    A merely-present tap (down, or off the bridge) is NOT ready: the raw sungem NIC
-    would open it but the guest would never reach dnsmasq. Parses `ip -o link show`
-    for the UP flag (inside the `<...>` flag list) and the `master <bridge>` field."""
-    p = _run(["ip", "-o", "link", "show", tap])
+    """True only if `tap` EXISTS, is administratively UP, enslaved to `bridge`, and a
+    bridge-isolated port. A merely-present tap (down, off the bridge, on the WRONG bridge,
+    or not isolated) is NOT ready: the raw sungem NIC would open it but the guest would
+    never reach the right dnsmasq / would see its sibling clones. Parses `ip -d -o link
+    show` for the UP flag (inside the `<...>` flag list), `master <bridge>` and
+    `isolated on` (bridge_slave detail)."""
+    p = _run(["ip", "-d", "-o", "link", "show", tap])
     if p.returncode != 0:
         return False
     out = p.stdout
     flags = out.split("<", 1)[1].split(">", 1)[0] if "<" in out else ""
     is_up = "UP" in flags.split(",")
-    enslaved = f"master {bridge}" in out
-    return is_up and enslaved
+    enslaved = f"master {bridge} " in out + " "
+    return is_up and enslaved and "isolated on" in out
 
 
 def create_ppc_tap(tap: str, *, bridge: str = PPC_TAP_BRIDGE, user: str = PPC_TAP_USER) -> None:
@@ -112,11 +122,15 @@ def create_ppc_tap(tap: str, *, bridge: str = PPC_TAP_BRIDGE, user: str = PPC_TA
     if enslave.returncode != 0:
         _run(["sudo", "ip", "link", "del", tap])  # don't leave an unbridged half-tap behind
         raise CloneError(f"tap enslave to {bridge} failed for {tap}: {enslave.stderr.strip()}")
+    iso = _run(["sudo", "ip", "link", "set", "dev", tap, "type", "bridge_slave", "isolated", "on"])
+    if iso.returncode != 0:
+        _run(["sudo", "ip", "link", "del", tap])  # never leave a non-isolated ppc port behind
+        raise CloneError(f"tap isolate failed for {tap}: {iso.stderr.strip()}")
     # Confirm the tap actually came up UP+enslaved before trusting it (guards a silent
     # no-op success from a stubbed/odd `ip`).
     if not _tap_ready(tap, bridge):
         _run(["sudo", "ip", "link", "del", tap])
-        raise CloneError(f"tap {tap} not UP+enslaved to {bridge} after setup")
+        raise CloneError(f"tap {tap} not UP+enslaved+isolated on {bridge} after setup")
 
 
 def delete_ppc_tap(tap: str) -> None:
@@ -329,15 +343,20 @@ def clone_base(
     emulator: str = DEFAULT_EMULATOR,
     agent_sock: str = "",
     pulse_server: str = "",
+    ppc_bridge: str = PPC_TAP_BRIDGE,
 ) -> tuple[Path, Path]:
     """Make the overlay + write the domain XML. Returns (overlay_path, xml_path).
     Does NOT define/start — the caller drives the backend."""
+    # domain_name is interpolated into overlay/XML paths below; containment must not
+    # depend on the caller having slug-validated it (rvmc's REST edge does, other
+    # consumers of this library may not).
+    safe_segment(domain_name, field="domain_name")
     # ppc/mac99 NIC is a raw host-managed tap (not a libvirt-managed interface): it
     # MUST exist on the NAT bridge, owned by the qemu user, before the domain is
     # defined+started. Create it here (idempotent). x86 guests skip this entirely —
     # libvirt creates+owns their tap automatically. (research/58)
     if base.hw.arch == "ppc":
-        create_ppc_tap(ppc_tap_name(domain_name))
+        create_ppc_tap(ppc_tap_name(domain_name), bridge=ppc_bridge)
 
     overlay_path = Path(overlays_dir) / f"{domain_name}.qcow2"
     if base.hw.blank_disk_gb > 0:

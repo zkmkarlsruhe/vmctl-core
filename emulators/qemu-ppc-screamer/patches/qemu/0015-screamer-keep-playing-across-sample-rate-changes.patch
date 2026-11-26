@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Marc <marc@schuetze.io>
+Date: Mon, 2 Nov 2026 09:13:05 +0100
+Subject: [PATCH 15/16] screamer: keep playing across sample rate changes
+
+Every write to the sound control register reopened the voice and
+allocated a new mix buffer sized for the new rate, while wpos/rpos and
+a deferred DMA transfer stayed. After a switch to a lower rate
+s->samples - s->wpos went negative, and with the buffer empty the
+callback returned before resuming the deferred transfer: the DBDMA
+channel waited forever and output stayed silent until reset.
+
+Reopen only when the rate changes, free the old buffer and reset the
+positions, resume a deferred transfer from an empty buffer, and drop a
+trailing partial frame that can never be transferred.
+---
+ hw/audio/screamer.c | 65 ++++++++++++++++++++++++++++++---------------
+ 1 file changed, 43 insertions(+), 22 deletions(-)
+
+diff --git a/hw/audio/screamer.c b/hw/audio/screamer.c
+index bd1463d36..2eac01131 100644
+--- a/hw/audio/screamer.c
++++ b/hw/audio/screamer.c
+@@ -70,15 +70,23 @@ static void pmac_screamer_tx_transfer(ScreamerState *s)
+     int samples;
+ 
+     samples = MIN(io->len >> s->shift, s->samples - s->wpos);
+-    dma_memory_read(&address_space_memory, io->addr,
+-                    &s->mixbuf[s->wpos << s->shift], samples << s->shift,
+-                    MEMTXATTRS_UNSPECIFIED);
++    if (samples > 0) {
++        dma_memory_read(&address_space_memory, io->addr,
++                        &s->mixbuf[s->wpos << s->shift], samples << s->shift,
++                        MEMTXATTRS_UNSPECIFIED);
+ 
+-    SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
++        SCREAMER_DPRINTF("DMA actually transferred 0x%x, wpos is %d\n", samples << s->shift, s->wpos);
+ 
+-    io->addr += (samples << s->shift);
+-    io->len -= (samples << s->shift);
+-    s->wpos += samples;
++        io->addr += (samples << s->shift);
++        io->len -= (samples << s->shift);
++        s->wpos += samples;
++    }
++
++    /* A trailing partial frame can never be transferred: drop it */
++    if (io->len && (io->len >> s->shift) == 0) {
++        io->addr += io->len;
++        io->len = 0;
++    }
+ 
+     /* Continue DBDMA if we have completed the transfer, otherwise defer */
+     if (io->len == 0) {
+@@ -189,28 +197,32 @@ static void screamerspk_callback(void *opaque, int free_b)
+         return;
+     }
+ 
+-    if (s->wpos - s->rpos == 0) {
+-        return;
+-    }
++    if (s->rpos < s->wpos) {
++        samples = MIN(s->samples, free_b >> s->shift);
++        generated = MIN(samples, s->wpos - s->rpos);
+ 
+-    samples = MIN(s->samples, free_b >> s->shift);
+-    generated = MIN(samples, s->wpos - s->rpos);
++        audio_be_write(s->be, s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
++                       generated << s->shift);
+ 
+-    audio_be_write(s->be, s->voice, s->mixbuf + (uintptr_t)(s->rpos << s->shift),
+-              generated << s->shift);
++        SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
+ 
+-    SCREAMER_DPRINTF("  - generated %d, wpos %d, rpos %d\n", generated, s->wpos, s->rpos);
+-    
+-    s->regs[FRAME_CNT_REG] += generated;
+-    s->rpos += generated;
+-    if (s->rpos < s->wpos) {
+-        return;
++        s->regs[FRAME_CNT_REG] += generated;
++        s->rpos += generated;
++        if (s->rpos < s->wpos) {
++            return;
++        }
+     }
+ 
++    /*
++     * Buffer drained. Resume a deferred transfer even if nothing was buffered:
++     * after a rate change the buffer is empty while the DMA still waits.
++     */
++
+     s->wpos = 0;
+     s->rpos = 0;
+ 
+-    if (io->len) {
++    /* only while the guest keeps the channel running (a stopped one is not resumed) */
++    if (io->len && (((DBDMA_channel *)io->channel)->regs[DBDMA_STATUS] & RUN)) {
+         DBDMA_channel *ch = io->channel;
+         uint32_t status = ch->regs[DBDMA_STATUS];
+ 
+@@ -241,9 +253,13 @@ static void screamer_update_settings(ScreamerState *s)
+         exit(1);
+     }
+ 
++    /* the buffer size follows the rate: start over with an empty one */
+     s->shift = 2;
+     s->samples = audio_be_get_buffer_size_out(s->be, s->voice) >> s->shift;
++    g_free(s->mixbuf);
+     s->mixbuf = g_malloc0(s->samples << s->shift);
++    s->wpos = 0;
++    s->rpos = 0;
+ 
+     audio_be_set_active_out(s->be, s->voice, true);
+ }
+@@ -292,6 +308,8 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
+ 
+ static void screamer_control_write(ScreamerState *s, uint32_t val)
+ {
++    uint32_t old_rate = s->rate;
++
+     SCREAMER_DPRINTF("%s: val %" PRId32 "\n", __func__, val);
+         
+     /* Basic rate selection */
+@@ -323,7 +341,10 @@ static void screamer_control_write(ScreamerState *s, uint32_t val)
+     }
+ 
+     SCREAMER_DPRINTF("basic rate: %d\n", s->rate);
+-    screamer_update_settings(s);
++    /* every control write used to reopen the voice and drop the buffered audio */
++    if (s->rate != old_rate) {
++        screamer_update_settings(s);
++    }
+     
+     s->regs[0] = val;
+ }

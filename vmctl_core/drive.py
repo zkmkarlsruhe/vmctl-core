@@ -36,13 +36,14 @@ from pydantic import BaseModel, Field
 
 from .atomicio import write_text_atomic
 from .network_config import NETWORK_CONFIG_NAME, NetworkConfig
+from .paths import safe_segment
 
 STAGES = ("intake", "analysis", "workbench", "exhibition")
 
 # ArtworkDrive instances are cheap, disposable path wrappers — two callers editing the SAME
 # drive.yaml hold DIFFERENT ArtworkDrive objects, so a per-instance lock wouldn't serialise
 # them. Key the lock on the drive's resolved path so every editor of one drive shares one lock
-# and a load→mutate-one-field→save sequence (set_stage / save_network_config) can't be split
+# and a load→mutate-one-field→save sequence (save_network_config) can't be split
 # by a concurrent editor (which would os.replace() a snapshot missing the other's field).
 _DRIVE_LOCKS: dict[str, threading.Lock] = {}
 _DRIVE_LOCKS_GUARD = threading.Lock()
@@ -73,17 +74,6 @@ SUBDIRS = (
 )
 
 MANIFEST_NAME = "drive.yaml"
-
-
-def _confine_to_analysis(name: str) -> None:
-    """Guard: a network-config artifact name must be a bare filename living directly under
-    ``analysis/``. The pointer is trusted input from autopsy, but an absolute path or a
-    ``../`` escape (whether a bug or a poisoned manifest) would let a load/save read/overwrite
-    ``drive.yaml`` or anything outside the drive. Keep it defensively confined."""
-    if not name or name in (".", "..") or name != Path(name).name:
-        raise ValueError(
-            f"network_config name must be a bare filename under analysis/, got {name!r}"
-        )
 
 
 class ArtworkMeta(BaseModel):
@@ -218,8 +208,7 @@ class ArtworkDrive:
         """Create (or complete) the drive skeleton for ``artwork_id``. Idempotent:
         directories are ensured on every call, ``drive.yaml`` is written only when
         missing — an existing manifest is NEVER touched."""
-        if not artwork_id or "/" in artwork_id or artwork_id in (".", ".."):
-            raise ValueError(f"invalid artwork id {artwork_id!r}")
+        safe_segment(artwork_id, field="artwork id")
         drive = cls(Path(drives_root) / artwork_id)
         for sub in SUBDIRS:
             (drive.path / sub).mkdir(parents=True, exist_ok=True)
@@ -256,7 +245,7 @@ class ArtworkDrive:
         name = self.load().analysis.network_config
         if not name:
             return None
-        _confine_to_analysis(name)
+        safe_segment(name, field="network_config name")
         path = self.analysis_dir / name
         if not path.exists():
             return None
@@ -268,28 +257,15 @@ class ArtworkDrive:
         """Atomically write ``config`` under ``analysis/`` and record the pointer in
         the manifest (``analysis.network_config``). ``analysis/`` is ensured first so
         this works on a fresh drive."""
-        _confine_to_analysis(name)
+        safe_segment(name, field="network_config name")
         self.analysis_dir.mkdir(parents=True, exist_ok=True)
         config.save(self.analysis_dir / name)
-        # load→mutate-one-field→save under the per-drive lock: a concurrent set_stage()
+        # load→mutate-one-field→save under the per-drive lock: a concurrent editor
         # must not overwrite the pointer we just set (or vice-versa).
         with _drive_lock(self.path):
             m = self.load()
             m.analysis.network_config = name
             self.save(m)
-
-    # --- stage --------------------------------------------------------------
-    def set_stage(self, stage: str) -> DriveManifest:
-        """Move the marker (not a gate — any direction is legal)."""
-        if stage not in STAGES:
-            raise ValueError(f"unknown stage {stage!r} (expected one of {STAGES})")
-        # load→mutate-one-field→save under the per-drive lock, so a concurrent editor
-        # (save_network_config / another set_stage) can't clobber this write.
-        with _drive_lock(self.path):
-            m = self.load()
-            m.stage = stage
-            self.save(m)
-            return m
 
     # --- checksums ------------------------------------------------------------
     @staticmethod
@@ -299,12 +275,3 @@ class ArtworkDrive:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest()
-
-    def artwork_checksums(self) -> dict[str, str]:
-        """sha256 per file under ``artwork/`` (relpath → digest) — the integrity
-        record of the immutable original."""
-        out: dict[str, str] = {}
-        for p in sorted(self.artwork_dir.rglob("*")):
-            if p.is_file():
-                out[str(p.relative_to(self.artwork_dir))] = self.sha256_file(p)
-        return out

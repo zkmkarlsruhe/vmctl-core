@@ -1,23 +1,8 @@
 """Classic Mac OS 9 reference module.
 
-Historically the opposite extreme from Windows XP: a non-wired stub with only the
-universal datalink CD, because there was no in-guest agent. research/64 changed
-that for good: a fresh mac9 base clones the golden ``mac9-922-agent-golden.qcow2``,
-which autostarts TWO faceless MacPython 2.3.3 agents that listen for **plain HTTP
-JSON-RPC over the libvirt NAT** (NOT a vioser channel, NOT the old research/58
-per-instance helper container — that scheme is gone):
-
-* ``:9610`` — the main agent. POST ``/rpc`` with ``{"name": T, "arguments": A}``
-  returns ``{"ok": true, "result": ...}`` (or ``{"ok": false, "error": ...}``).
-  Tools include ``read_file{path}``, ``exec{code}`` (STRICT Python 2.3),
-  ``process_list``, ``system_info``, screenshot/send_keys/mouse, write_file, launch.
-* ``:9611`` — the ctl failsafe agent, same contract, ``read_file``/``exec`` only.
-
-The controller resolves the instance IP (``guest_ip()``, dnsmasq lease parse,
-research/64 Task 3) and reaches the agent at ``http://<guest_ip>:9610/rpc``. The
-mac9-only ``guest_call`` shim that does this HTTP lives in the controller and is
-handed to this module through the :class:`GuestContext` — so ``read_logs`` below is
-pure strategy and never knows the transport.
+The faceless MacPython agent speaks VA1 over TCP 9009 on the libvirt NAT.
+The controller resolves the guest IP and supplies a GuestContext returning VA1
+Reply objects and chunked raw file reads. This module stays transport-independent.
 
 Capability vs tools: the ``Capability`` enum is for cross-OS *behaviours* the
 controller branches on (event log, NSS-CA, netsh, resolution API). Mac OS 9 has
@@ -34,8 +19,6 @@ Basilisk II. The GuestOS module stays separate from that VMBackend concern.
 """
 
 from __future__ import annotations
-
-import base64
 
 from ..capabilities import Capabilities, Capability
 from ..contract import BaseGuestOSModule, LogRecord
@@ -59,13 +42,14 @@ def _tail(lines: list[str], count: int) -> list[str]:
 
 
 class MacOS9Module(BaseGuestOSModule):
-    os_labels: tuple[str, ...] = ("mac-os-9", "macos9", "mac-os", "system-7", "system-8")
+    os_labels: tuple[str, ...] = ("mac-os-9", "macos9", "mac-os", "system-8")
+    # System 7 (68k, q800) has its own module: mac_os_7.MacOS7Module
     display_name = "Mac OS 9 / Classic"
 
     def caps(self) -> Capabilities:
         # DATALINK_MOUNT: the universal host->guest CD (always available).
-        # AGENT: the research/64 faceless MacPython agent on :9610 (+ :9611 ctl)
-        #   over plain HTTP JSON-RPC on the libvirt NAT. gate_by_agent() drops AGENT
+        # AGENT: the faceless MacPython VA1 agent on TCP :9009
+        #   on the libvirt NAT. gate_by_agent() drops AGENT
         #   (and READ_LOGS, which rides the agent) for a mac9 base baked WITHOUT the
         #   agent (agent:false), so the old stub goldens degrade exactly as before.
         # READ_LOGS: generic text logs — agentbox lifecycle log, crash breadcrumb,
@@ -81,13 +65,12 @@ class MacOS9Module(BaseGuestOSModule):
         )
 
     def agent_transport(self, ctx) -> str:
-        # Plain HTTP JSON-RPC on the libvirt NAT (the controller's mac9 guest_call
-        # shim POSTs to http://<guest_ip>:9610/rpc). Not vioser, not a unix socket.
+        # VA1 TCP on the libvirt NAT; the controller resolves the guest IP.
         return "tcp"
 
     # --- logs ---------------------------------------------------------------
     def read_logs(self, ctx, *, kind: str = "agentbox", count: int = 50) -> list[LogRecord]:
-        """Generic text logs for Mac OS 9, via the faceless agent (read_file/exec).
+        """Generic text logs for Mac OS 9, via the faceless agent (read_file/run_script).
 
         kinds:
           agentbox    -> the agent lifecycle log rvmc_faceless.log (+ rvmc_ctl.log):
@@ -96,7 +79,7 @@ class MacOS9Module(BaseGuestOSModule):
                          ``UP ... prev=DIRTY`` (last run force-killed/crashed) is
                          marked level=warning so the viewer can flag it.
           diagnostics -> live Gestalt system info + memory (MaxBlock/FreeMem) +
-                         the Finder process roster, computed in-guest via exec.
+                         the Finder process roster, computed in-guest via run_script.
         """
         kind = (kind or "agentbox").lower()
         if kind == "breadcrumb":
@@ -107,16 +90,8 @@ class MacOS9Module(BaseGuestOSModule):
 
     # --- agentbox: lifecycle logs (read_file, tail) -------------------------
     def _read_file_text(self, ctx, path: str) -> str:
-        """Fetch a guest file via the agent's read_file and decode it. read_file
-        returns {"path","bytes","data_b64"}; ctx.guest_call unwraps to {"result": ..}."""
-        res = ctx.guest_call("read_file", path=path).get("result") or {}
-        b64 = res.get("data_b64") if isinstance(res, dict) else None
-        if not b64:
-            return ""
-        try:
-            return base64.b64decode(b64).decode("mac-roman", "replace")
-        except Exception:
-            return base64.b64decode(b64).decode("latin-1", "replace")
+        """Fetch all raw VA1 file chunks and decode classic Mac text."""
+        return ctx.guest_read_file(path).decode("mac-roman", "replace")
 
     def _read_agentbox(self, ctx, count: int) -> list[LogRecord]:
         out: list[LogRecord] = []
@@ -146,9 +121,9 @@ class MacOS9Module(BaseGuestOSModule):
             out.append(LogRecord(source="breadcrumb", level=level, message=ln))
         return out
 
-    # --- diagnostics: live Gestalt + memory + process roster (exec) ---------
-    # STRICT Python 2.3 — runs inside MacPython 2.3.3. The agent's exec captures
-    # stdout as result["out"]; we print one human line per fact (no json module on
+    # --- diagnostics: live Gestalt + memory + process roster (run_script) ---------
+    # STRICT Python 2.3 — runs inside MacPython 2.3.3. The agent's run_script captures
+    # stdout in Reply.kv["stdout"]; we print one human line per fact (no json module on
     # 2.3 by default). gestalt is a top-level builtin module here (not Carbon).
     _DIAG_PY = (
         "import sys\n"
@@ -182,7 +157,7 @@ class MacOS9Module(BaseGuestOSModule):
 
     def _read_diagnostics(self, ctx) -> list[LogRecord]:
         try:
-            res = ctx.guest_call("exec", code=self._DIAG_PY, timeout=40).get("result") or {}
+            res = ctx.guest_call("run_script", lang="python", code=self._DIAG_PY, timeout=40).kv
         except Exception as e:
             return [
                 LogRecord(
@@ -191,18 +166,15 @@ class MacOS9Module(BaseGuestOSModule):
                     message=f"(diagnostics unavailable: {e})",
                 )
             ]
-        if isinstance(res, dict):
-            if not res.get("exec_ok", True):
-                return [
-                    LogRecord(
-                        source="diagnostics",
-                        level="error",
-                        message="exec failed: %s" % (res.get("err") or "?"),
-                    )
-                ]
-            out_text = res.get("out") or ""
-        else:
-            out_text = str(res)
+        if res.get("exit") != "0":
+            return [
+                LogRecord(
+                    source="diagnostics",
+                    level="error",
+                    message="run_script failed: %s" % (res.get("stderr") or "?"),
+                )
+            ]
+        out_text = res.get("stdout") or ""
         recs: list[LogRecord] = []
         for ln in _split_lines(out_text):
             if not ln.strip():
@@ -219,8 +191,8 @@ class MacOS9Module(BaseGuestOSModule):
             "install/clone Mac OS 9.2.2 (SheepShaver cannot run 9.2.x)",
             "audio requires the qemu screamer fork; stock qemu boots silent",
             "put the sungem NIC on the libvirt NAT (default net) for guest networking",
-            "bake the two faceless MacPython agents (rvmc_faceless :9610 + rvmc_ctl "
-            ":9611, research/64) into System Folder > Startup Items so they autostart "
-            "headless and serve HTTP JSON-RPC; set the base agent:true to light the "
+            "bake the faceless MacPython VA1 agent (TCP :9009) "
+            "into System Folder > Startup Items so it autostarts "
+            "headless; set the base agent:true to light the "
             "AGENT + READ_LOGS capabilities",
         ]
