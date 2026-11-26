@@ -11,8 +11,13 @@ The shared foundation library for the vmctl born-digital-art conservation platfo
 
 Shared foundation for ZKM's VM-conservation controllers. Provides:
 
-- **Pluggable VM backend** (`backends/`) — one `VMBackend` Protocol, implementations for
-  libvirt (`qemu:///system`) now and `qemu-direct` (QMP) later.
+- **Pluggable VM backend** (`backends/`) — one `VMBackend` Protocol; the catalog's `hw.backend`
+  selects one of five implementations (`backends/registry.py`):
+  - `libvirt` — libvirt (`qemu:///system`), including the qemu-system-ppc Mac OS 9 tier.
+  - `q800` — qemu-system-m68k `-M q800` as a process with QMP + VNC.
+  - `sheepshaver` — SheepShaver (classic Mac PPC) SDL2 emulator in an Xvfb + x11vnc process group.
+  - `basilisk2` — Basilisk II (classic Mac 68k) SDL2 emulator in an Xvfb + x11vnc process group.
+  - `process` — any emulator run from one command line (e.g. MAME, FS-UAE), defined by `process.json`.
 - **Shared plugin spec + runtime** (`plugins/`) — the contract a plugin conforms to; a plugin
   built and tested in the **research** controller promotes unchanged to the **exhibition** controller.
 - Snapshot helpers, screen capture, guest I/O (QEMU guest agent).
