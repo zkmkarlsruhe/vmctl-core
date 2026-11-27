@@ -70,7 +70,9 @@ def run(
         except (SkipCheck, UnsupportedImageFormat) as exc:
             checks.append(Check(name, "SKIP", str(exc)))
         except Exception as exc:
-            checks.append(Check(name, "FAIL", str(exc)))
+            checks.append(
+                Check(name, "FAIL", str(exc) or repr(exc))
+            )  # TimeoutError() has no message
         else:
             checks.append(Check(name, "PASS"))
 
@@ -182,11 +184,12 @@ def run(
             "netbsd",
             "openbsd",
         ):
-            tool, args = "run_shell", {"cmd": "sleep 1", "timeout": "3"}
+            tool, args = "run_shell", {"cmd": "sleep 1", "timeout": "15"}
         elif "run_script" in hello.tools:
             tool, args = (
                 "run_script",
-                {"lang": "python", "code": "import time; time.sleep(1)", "timeout": "3"},
+                # 15 s: a fresh Win11 needs over 2 s to start the child interpreter (live, 2026-11-27)
+                {"lang": "python", "code": "import time; time.sleep(1)", "timeout": "15"},
             )
         else:
             raise SkipCheck("no safe slow tool advertised")
@@ -214,7 +217,7 @@ def run(
                     observer.receive(ping_id)[1] == b"OK" and not future.done(),
                     "ping waited for running tool",
                 )
-                reply = future.result(timeout=5)
+                reply = future.result(timeout=20)
                 require(reply[1] == b"OK", "slow tool failed")
                 observer.send(_wire(ident, tool, observer.hello, args))
                 require(observer.receive(ident) == reply, "completed slow call did not replay")

@@ -1,0 +1,18 @@
+{
+  "exclude": [],
+  "baseline": {
+    "tests/test_agentwire.py": 818,
+    "tests/test_qemu_q800.py": 869,
+    "vmctl_core/agentwire/conformance.py::run": 279,
+    "vmctl_core/agentwire/fakeagent.py::FakeAgent._tool": 202,
+    "vmctl_core/backends/libvirt_backend.py::LibvirtBackend": 621,
+    "vmctl_core/backends/mac_emu.py": 875,
+    "vmctl_core/backends/mac_emu.py::_MacEmuBackend": 653,
+    "vmctl_core/backends/qemu_q800.py": 1342,
+    "vmctl_core/backends/qemu_q800.py::Q800Backend": 1026,
+    "vmctl_core/capture.py": 986,
+    "vmctl_core/capture.py::NetworkMonitor": 922,
+    "vmctl_core/capture.py::NetworkMonitor._http_transactions": 126,
+    "vmctl_core/promotion.py::pack_bundle_zip": 159
+  }
+}
