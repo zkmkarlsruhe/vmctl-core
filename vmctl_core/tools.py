@@ -24,8 +24,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .atomicio import write_text_atomic
-from .paths import safe_segment
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.paths import safe_segment
 
 
 def _now() -> str:

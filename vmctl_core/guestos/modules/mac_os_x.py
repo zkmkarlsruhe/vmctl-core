@@ -36,8 +36,8 @@ from __future__ import annotations
 
 import hashlib
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, CertProfile, LogRecord
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, CertProfile, LogRecord
 
 # Where the snowleopard agent writes its own log (guest-agent/snowleopard plist).
 _AGENT_LOG = "/tmp/sl_agent.log"

@@ -10,10 +10,10 @@ from queue import Empty, LifoQueue
 from threading import Lock
 from typing import TYPE_CHECKING, Literal
 
-from . import _va1
+from vmctl_core.agentwire import _va1
 
 if TYPE_CHECKING:
-    from .client import Hello
+    from vmctl_core.agentwire.client import Hello
 
 Policy = Literal["persistent", "per_call"]
 

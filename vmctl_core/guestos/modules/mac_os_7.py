@@ -13,8 +13,8 @@ declares no in-guest code runtime.
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, LogRecord
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, LogRecord
 
 # The agent logs to System Folder:Preferences (NOT next to the app: the Finder "opens"
 # every document in Startup Items at boot). Boot volume name of the q800 golden.

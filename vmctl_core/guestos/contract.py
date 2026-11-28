@@ -21,8 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .capabilities import Capabilities
-from .context import GuestContext
+from vmctl_core.guestos.capabilities import Capabilities
+from vmctl_core.guestos.context import GuestContext
 
 
 class Unsupported(NotImplementedError):

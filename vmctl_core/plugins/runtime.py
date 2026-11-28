@@ -22,10 +22,10 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from .spec import MANIFEST_FILENAME, PluginManifest
+from vmctl_core.plugins.spec import MANIFEST_FILENAME, PluginManifest
 
 if TYPE_CHECKING:  # type-only: the runtime never needs the catalog module imported
-    from ..tools import ToolsLibrary
+    from vmctl_core.tools import ToolsLibrary
 
 logger = logging.getLogger(__name__)
 
@@ -447,7 +447,9 @@ def _warn_backend_host_conflicts(loaded: list[LoadedPlugin]) -> None:
     ``claims_overlap``. This both catches a plugin that claims extra ports BEYOND its
     backend_host (the old backend_host-only check missed those) and stops falsely flagging
     two plugins that legitimately split the same host by method/path."""
-    from ..router.router import claims_overlap  # local: avoid a plugins<->router import cycle
+    from vmctl_core.router.router import (
+        claims_overlap,
+    )  # local: avoid a plugins<->router import cycle
 
     items = [(lp.manifest.id, lp.manifest.effective_claims()) for lp in loaded]
     for i in range(len(items)):

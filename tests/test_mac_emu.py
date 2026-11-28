@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -228,6 +229,19 @@ def test_snapshot_create_refuses_while_running(tmp_path):
     assert be.snapshot_list() == []  # nothing copied while running
 
 
+def _wait_for_argv(proc: subprocess.Popen, token: str, timeout: float = 5.0) -> None:
+    """Block until the child's /proc cmdline carries `token`.
+
+    Popen returns as soon as the vfork'd child calls exec, before the kernel has set up
+    its argv; /proc/<pid>/cmdline reads empty in that window (measured: 271 of 300
+    immediate reads on Python 3.14).
+    """
+    deadline = time.monotonic() + timeout
+    while token.encode() not in Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0"):
+        assert time.monotonic() < deadline, f"child {proc.pid} never showed {token!r} in argv"
+        time.sleep(0.005)
+
+
 def test_is_running_consults_pidfile_across_restart(tmp_path):
     """A restarted controller (empty _procs) still sees the trio via the pidfile,
     so a retry does not duplicate-launch on the same display/port."""
@@ -240,6 +254,7 @@ def test_is_running_consults_pidfile_across_restart(tmp_path):
         [sys.executable, "-c", "import time; time.sleep(30)", "--config", str(be.prefs_path)]
     )
     try:
+        _wait_for_argv(live, str(be.prefs_path))
         be.pidfile_path.write_text(json.dumps({"emulator": live.pid}))
         assert be._procs == {} and be.is_running() is True
     finally:

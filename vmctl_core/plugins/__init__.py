@@ -5,16 +5,16 @@ import this runtime so a plugin runs unchanged in either. The registration
 surface is kept compatible with exhibition's original plugins.py.
 """
 
-from .contract import plugin_spec
-from .runtime import (
+from vmctl_core.plugins.contract import plugin_spec
+from vmctl_core.plugins.runtime import (
     LoadedPlugin,
     PluginRegistry,
     PluginRequest,
     PluginResponse,
     load_plugins,
 )
-from .scaffold import new_plugin, slugify
-from .spec import MANIFEST_FILENAME, PluginManifest, PluginTarget
+from vmctl_core.plugins.scaffold import new_plugin, slugify
+from vmctl_core.plugins.spec import MANIFEST_FILENAME, PluginManifest, PluginTarget
 
 __all__ = [
     "MANIFEST_FILENAME",

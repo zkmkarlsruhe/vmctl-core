@@ -41,18 +41,8 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = [
-    "E",    # pycodestyle errors
-    "F",    # pyflakes
-    "I",    # isort
-    "UP",   # pyupgrade
-    "B",    # bugbear
-    "SIM",  # simplify
-    "RUF",
-]
-ignore = [
-    "E501",  # line length handled by the formatter
-]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF", "TID"]  # shared vmctl baseline, see docs.vmctl.org/contributing/engineering/
+ignore = ["E501"]  # line length is the formatter's job
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B"]

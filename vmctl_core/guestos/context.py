@@ -17,8 +17,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from ..agentwire import Reply
-from ..catalog import BaseImage
+from vmctl_core.agentwire import Reply
+from vmctl_core.catalog import BaseImage
 
 
 class GuestContext(Protocol):

@@ -28,11 +28,11 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
-from ..atomicio import write_text_atomic
-from ..catalog import BaseImage
-from ..introspect.liveness import probe
-from ..paths import safe_segment
-from .base import BackendError
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.backends.base import BackendError, checked_snapshot_name
+from vmctl_core.catalog import BaseImage
+from vmctl_core.introspect.liveness import probe
+from vmctl_core.paths import safe_segment
 
 SPEC_FILE = "process.json"
 STOP_TIMEOUT_S = 5.0
@@ -434,6 +434,7 @@ class ProcessBackend:
     def snapshot_create(self, name: str, *, memory: bool = True) -> None:
         """Replace snapshot ``name`` with a copy of the images, atomically: a failure leaves
         the previous snapshot in place. ``memory`` has no effect, there is no RAM state."""
+        name = checked_snapshot_name(name)
         with self._lock:
             if self.is_running():
                 raise BackendError(f"{self.name}: stop the emulator before a snapshot")
@@ -457,6 +458,7 @@ class ProcessBackend:
 
     def snapshot_revert(self, name: str) -> None:
         """Restore the images, verified. Leaves the emulator stopped."""
+        name = checked_snapshot_name(name)
         with self._lock:
             source = self._snapshots / name
             if name not in self.snapshot_list():
@@ -472,6 +474,7 @@ class ProcessBackend:
                 tmp.replace(self._resolve(image))
 
     def snapshot_delete(self, name: str) -> None:
+        name = checked_snapshot_name(name)
         with self._lock:
             if name not in self.snapshot_list():
                 raise BackendError(f"{self.name}: no snapshot {name!r}")

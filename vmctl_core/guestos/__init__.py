@@ -25,10 +25,10 @@ hypervisor"; ``GuestOSModule`` is "given a running guest, how does THIS OS do X"
 
 from __future__ import annotations
 
-from .capabilities import AGENT_DEPENDENT, Capabilities, Capability, gate_by_agent
-from .context import GuestContext
-from .contract import CertProfile, EventRecord, GuestOSModule, LogRecord
-from .registry import GuestOSRegistry, default_registry
+from vmctl_core.guestos.capabilities import AGENT_DEPENDENT, Capabilities, Capability, gate_by_agent
+from vmctl_core.guestos.context import GuestContext
+from vmctl_core.guestos.contract import CertProfile, EventRecord, GuestOSModule, LogRecord
+from vmctl_core.guestos.registry import GuestOSRegistry, default_registry
 
 __all__ = [
     "AGENT_DEPENDENT",

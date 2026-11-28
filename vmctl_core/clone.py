@@ -15,9 +15,9 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from .atomicio import write_text_atomic
-from .catalog import BaseImage
-from .paths import safe_segment
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.catalog import BaseImage
+from vmctl_core.paths import safe_segment
 
 _TEMPLATES = Path(__file__).parent / "templates"
 _env = Environment(

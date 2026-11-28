@@ -10,12 +10,12 @@ domain, which stays on libvirt — keeps its current backend unchanged.
 
 from __future__ import annotations
 
-from ..catalog import BaseImage
-from .base import VMBackend
-from .libvirt_backend import LibvirtBackend
-from .mac_emu import BasiliskIIBackend, MacEmuSettings, SheepShaverBackend
-from .process import ProcessBackend
-from .qemu_q800 import Q800Backend
+from vmctl_core.backends.base import VMBackend
+from vmctl_core.backends.libvirt_backend import LibvirtBackend
+from vmctl_core.backends.mac_emu import BasiliskIIBackend, MacEmuSettings, SheepShaverBackend
+from vmctl_core.backends.process import ProcessBackend
+from vmctl_core.backends.qemu_q800 import Q800Backend
+from vmctl_core.catalog import BaseImage
 
 # valid explicit hw.backend values
 LIBVIRT = "libvirt"

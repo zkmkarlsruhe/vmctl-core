@@ -11,9 +11,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from . import _va1
-from .images import UnsupportedImageFormat, image_header
-from .transports import Connection, SocketTransport
+from vmctl_core.agentwire import _va1
+from vmctl_core.agentwire.images import UnsupportedImageFormat, image_header
+from vmctl_core.agentwire.transports import Connection, SocketTransport
 
 Kind = Literal["-", "rows", "raw"]
 Scalar = str | int | float | bool

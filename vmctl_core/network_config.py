@@ -23,7 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .atomicio import write_text_atomic
+from vmctl_core.atomicio import write_text_atomic
 
 #: current contract schema version (the ``schema`` field value writers emit)
 SCHEMA_VERSION = 1

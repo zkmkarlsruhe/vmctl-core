@@ -9,8 +9,8 @@ Windows event log — its guest logs are text (journald / syslog), surfaced via
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, CertProfile, LogRecord
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, CertProfile, LogRecord
 
 
 class LinuxModule(BaseGuestOSModule):

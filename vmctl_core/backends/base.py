@@ -16,9 +16,24 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from vmctl_core.paths import safe_segment
+
 
 class BackendError(RuntimeError):
     """A backend operation failed (wraps the underlying tool's stderr)."""
+
+
+def checked_snapshot_name(name: str) -> str:
+    """One path segment and one CLI token: no separator or traversal, no leading '-' (virsh
+    would parse it as an option) and no leading '.' (collides with the hidden staging dirs).
+    Free text otherwise: existing snapshots with spaces or non-ASCII names stay reachable."""
+    try:
+        safe_segment(name, field="snapshot name")
+    except ValueError as e:
+        raise BackendError(f"invalid snapshot name {name!r}: expected a bare path segment") from e
+    if name[0] in "-.":
+        raise BackendError(f"invalid snapshot name {name!r}: must not start with '-' or '.'")
+    return name
 
 
 @runtime_checkable

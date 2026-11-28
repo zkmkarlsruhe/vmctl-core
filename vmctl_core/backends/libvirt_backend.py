@@ -11,6 +11,7 @@ import base64
 import contextlib
 import ipaddress
 import json
+import logging
 import os
 import struct
 import subprocess
@@ -19,7 +20,11 @@ import time
 import xml.etree.ElementTree as ET
 import zlib
 
-from .base import BackendError
+from vmctl_core.backends._libvirt_domain import _LibvirtDomain
+from vmctl_core.backends._libvirt_domain import virsh as virsh
+from vmctl_core.backends.base import BackendError, checked_snapshot_name
+
+logger = logging.getLogger(__name__)
 
 # Ceiling for guest_read_file's QGA loop: the guest decides how much it sends, so an
 # uncapped read buffers arbitrary guest data into controller RAM. 64 MiB covers every
@@ -99,39 +104,12 @@ def ppm_to_png(ppm: bytes) -> bytes:
     )
 
 
-def virsh(
-    uri: str, *args: str, timeout: float = 30.0, check: bool = True
-) -> subprocess.CompletedProcess:
-    """The one ``virsh`` wrapper (domains here, networks in ``project_net``)."""
-    cmd = ["virsh", "-c", uri, *args]
-    # Force the C locale: stop()/get_settings() and the state parsers key off
-    # English virsh output ("not running", "Max memory", "Autostart"); under a
-    # localized LANG those substring checks silently break (stop() would raise on
-    # an already-stopped domain; get_settings() would return defaults).
-    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired as e:
-        # A hung libvirtd must surface as BackendError: state()/exists()/guest_ip()
-        # catch only that and would otherwise leak a traceback.
-        raise BackendError(f"virsh {' '.join(args)} timed out after {timeout:g}s") from e
-    if check and p.returncode != 0:
-        raise BackendError(f"virsh {' '.join(args)} failed: {p.stderr.strip()}")
-    return p
+class LibvirtBackend(_LibvirtDomain):
+    """A VMBackend bound to a single libvirt domain.
 
-
-class LibvirtBackend:
-    """A VMBackend bound to a single libvirt domain."""
-
-    def __init__(self, name: str, uri: str = "qemu:///system") -> None:
-        self.name = name
-        self.uri = uri
-
-    # --- virsh plumbing ---------------------------------------------------
-    def _virsh(
-        self, *args: str, timeout: float = 30.0, check: bool = True
-    ) -> subprocess.CompletedProcess:
-        return virsh(self.uri, *args, timeout=timeout, check=check)
+    An injected runner receives the full virsh argv, timeout in seconds and check flag.
+    It supplies text stdout and stderr, as the default C-locale subprocess runner does.
+    """
 
     def _agent(self, payload: dict, timeout: float = 15.0) -> dict:
         """Run a qemu-agent-command and return the parsed ``return`` value."""
@@ -220,33 +198,10 @@ class LibvirtBackend:
         # network capture works on the real tap for a ppc guest (research/64).
         return self._ppc_tap()
 
-    # --- domain definition ------------------------------------------------
-    def define(self, xml_path: str) -> None:
-        self._virsh("define", xml_path)
-
-    def dumpxml(self) -> str:
-        """The live/persistent domain XML."""
-        return self._virsh("dumpxml", self.name).stdout
-
     # dnsmasq lease DB for the libvirt NAT bridge. The ppc/mac99 raw-cmdline sungem
     # NIC is invisible to `virsh domifaddr` (libvirt doesn't know the qemu:commandline
     # NIC exists), so for ppc we resolve the lease by matching this file on the MAC.
     DNSMASQ_STATUS = "/var/lib/libvirt/dnsmasq/virbr0.status"
-
-    def _domain_arch(self) -> str | None:
-        """The domain's OS arch (e.g. 'ppc', 'x86_64') from its XML, or None."""
-        try:
-            root = ET.fromstring(self.dumpxml())
-            t = root.find("./os/type")
-            return t.get("arch") if t is not None else None
-        except (BackendError, ET.ParseError):
-            return None
-
-    def _is_ppc(self) -> bool:
-        """True for a ppc/mac99 (Mac OS 9) domain. Several virsh sub-features behave
-        differently on the screamer-qemu PPC fork (no --atomic snapshots, no managed
-        CD device, cmdline-only NIC) so they branch on this."""
-        return (self._domain_arch() or "").startswith("ppc")
 
     def _domain_macs(self) -> list[str]:
         """All MACs declared for this domain — both managed <interface> MACs AND the
@@ -337,73 +292,29 @@ class LibvirtBackend:
                         return ip
         return None
 
-    def define_xml(self, xml: str) -> None:
-        """Validate + redefine the persistent config from an XML string.
-        (Rewrites the inactive definition; a running domain keeps its current
-        devices until next boot.)"""
-        import tempfile
-
-        fd, path = tempfile.mkstemp(suffix=".xml")
-        try:
-            os.write(fd, xml.encode("utf-8"))
-            os.close(fd)
-            # best-effort schema check (won't fail the call if the tool is absent).
-            # A missing binary raises FileNotFoundError from exec — NOT a "command not
-            # found" line in stderr — so catch it explicitly and skip validation.
-            try:
-                v = subprocess.run(["virt-xml-validate", path], capture_output=True, text=True)
-            except FileNotFoundError:
-                v = None
-            if v is not None and v.returncode != 0:
-                raise BackendError(f"invalid domain XML: {v.stderr.strip() or v.stdout.strip()}")
-            self._virsh("define", path)
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(path)
-
-    def _ppc_tap(self) -> str | None:
-        """The per-instance host-managed tap of a ppc/mac99 domain, read from the
-        `-netdev tap,...,ifname=<tap>` qemu:commandline arg. None for x86 domains
-        (libvirt owns their tap) or if the domain has no such NIC."""
-        try:
-            root = ET.fromstring(self.dumpxml())
-        except (BackendError, ET.ParseError):
-            return None
-        ns = "http://libvirt.org/schemas/domain/qemu/1.0"
-        for arg in root.findall(f"./{{{ns}}}commandline/{{{ns}}}arg"):
-            val = arg.get("value") or ""
-            if val.startswith("tap,") and "ifname=" in val:
-                return val.split("ifname=", 1)[1].split(",")[0].strip()
-        return None
-
-    def undefine(self) -> None:
-        # Capture the ppc tap BEFORE the definition is gone, then clean it up after
-        # undefine. x86 domains have no host-managed tap here => _ppc_tap() is None.
-        tap = self._ppc_tap()
-        # --snapshots-metadata so internal snapshots don't block the undefine
-        p = self._virsh("undefine", self.name, "--snapshots-metadata", check=False)
-        # Tear the host tap down ONLY if the domain is actually gone. A failed undefine
-        # (domain still defined — e.g. running, or a virsh error) must keep its NIC:
-        # ripping the tap out from under a still-defined/running ppc guest kills its
-        # networking with no way back short of a re-clone.
-        if tap and p.returncode == 0:
-            # local import: clone owns the tap lifecycle (create on clone, delete here)
-            from ..clone import delete_ppc_tap
-
-            delete_ppc_tap(tap)
-
     # --- snapshots --------------------------------------------------------
     def snapshot_list(self) -> list[str]:
         p = self._virsh("snapshot-list", self.name, "--name")
         return [s.strip() for s in p.stdout.splitlines() if s.strip()]
 
-    def snapshot_create(self, name: str, *, memory: bool = True) -> None:
+    def snapshot_create(
+        self,
+        name: str,
+        *,
+        memory: bool = True,
+        description: str | None = None,
+        replace: bool = True,
+        timeout: float = 120.0,
+    ) -> None:
+        checked_snapshot_name(name)
         # Overwrite an existing snapshot of the same name. Plain snapshot-delete keeps
         # its children (libvirt reparents them); --children would silently delete every
         # snapshot taken after it, and q800 only drops the one name too.
-        if name in self.snapshot_list():
+        if replace and name in self.snapshot_list():
             self._virsh("snapshot-delete", self.name, name, check=False)
         args = ["snapshot-create-as", self.name, name]
+        if description is not None:
+            args.extend(["--description", description])
         # --atomic is unsupported on the screamer-qemu PPC fork (mac99) — virsh
         # rejects it there. x86/KVM keeps the atomic guarantee; ppc takes the plain
         # (still internal, single-domain) create. research/64.
@@ -418,14 +329,72 @@ class LibvirtBackend:
                 "libvirt: a live snapshot always includes RAM; stop the domain "
                 "for a disk-only snapshot"
             )
-        self._virsh(*args, timeout=120.0)
+        self._virsh(*args, timeout=timeout)
 
     def snapshot_revert(self, name: str) -> None:
-        self._virsh("snapshot-revert", self.name, name, timeout=120.0)
+        self._virsh("snapshot-revert", self.name, checked_snapshot_name(name), timeout=120.0)
         self._flush_conntrack()
 
-    def snapshot_delete(self, name: str) -> None:
-        self._virsh("snapshot-delete", self.name, name)
+    def snapshot_delete(
+        self, name: str, *, children: bool = False, timeout: float = 30.0, missing_ok: bool = False
+    ) -> None:
+        args = ["snapshot-delete", self.name, checked_snapshot_name(name)]
+        if children:
+            args.append("--children")
+        try:
+            self._virsh(*args, timeout=timeout)
+        except BackendError as exc:
+            if missing_ok and isinstance(exc.__cause__, subprocess.CalledProcessError):
+                stderr = exc.__cause__.stderr or ""
+                if (
+                    "No snapshot with name" in stderr
+                    or "domain snapshot not found" in stderr.lower()
+                ):
+                    return
+            raise
+        logger.debug("Deleted snapshot '%s'", name)
+
+    def _delete_snapshot_quiet(self, name: str, timeout: float) -> None:
+        try:
+            self.snapshot_delete(name, timeout=timeout, missing_ok=True)
+        except BackendError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, subprocess.TimeoutExpired):
+                logger.warning("Timed out deleting snapshot '%s'", name)
+            else:
+                detail = cause.stderr if isinstance(cause, subprocess.CalledProcessError) else exc
+                logger.warning("Could not delete snapshot '%s': %s", name, detail)
+
+    def refresh_snapshot(
+        self, name: str, *, timeout: float = 120.0, cleanup_timeout: float = 60.0
+    ) -> None:
+        """Refresh a baseline under the caller's lock, keeping a verified recovery point."""
+        checked_snapshot_name(name)
+        staging = checked_snapshot_name(f"{name}__staging")
+        logger.info("Creating snapshot '%s' for VM '%s'", name, self.name)
+
+        # Never use --children here: the new baseline is a child of staging.
+        # Plain snapshot-delete reparents it; recursive deletion would destroy it.
+        self._delete_snapshot_quiet(staging, cleanup_timeout)
+        self._virsh("snapshot-create-as", self.name, staging, timeout=timeout)
+        if staging not in self.snapshot_list():
+            self._delete_snapshot_quiet(staging, cleanup_timeout)
+            raise BackendError(
+                f"Staging snapshot '{staging}' not found after creation - refusing to "
+                f"delete the existing '{name}' snapshot"
+            )
+
+        self._delete_snapshot_quiet(name, cleanup_timeout)
+        try:
+            self._virsh("snapshot-create-as", self.name, name, timeout=timeout)
+        except BackendError as exc:
+            message = (
+                f"Failed to create final snapshot '{name}'; the verified snapshot '{staging}' "
+                f"has been kept as a recovery point - revert to it or retry the snapshot"
+            )
+            logger.critical(message)
+            raise BackendError(message) from exc
+        self._delete_snapshot_quiet(staging, cleanup_timeout)
 
     # --- screen -----------------------------------------------------------
     def screenshot(self, screen: int = 0) -> bytes:

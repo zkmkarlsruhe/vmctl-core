@@ -21,8 +21,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Literal
 
-from . import _va1
-from .client import AgentError
+from vmctl_core.agentwire import _va1
+from vmctl_core.agentwire.client import AgentError
 
 REQUIRED_TOOLS = frozenset(
     [
@@ -496,6 +496,9 @@ class FakeAgent:
                     continue
                 except OSError:
                     return
+                if one_stream and worker is not None:
+                    # a client that closed and reconnected at once races the old worker's EOF
+                    worker.join(timeout=0.5)
                 if one_stream and worker is not None and worker.is_alive():
                     sock.close()
                 else:

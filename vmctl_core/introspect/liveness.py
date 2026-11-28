@@ -7,12 +7,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .amiga import AmigaSample, AmigaView
-from .mac68k import MacView
-from .memory import ProcMemory, Unreadable
+from vmctl_core.introspect.amiga import AmigaSample, AmigaView
+from vmctl_core.introspect.mac68k import MacView
+from vmctl_core.introspect.memory import ProcMemory, Unreadable
 
 if TYPE_CHECKING:
-    from ..backends.process import ProbeSpec
+    from vmctl_core.backends.process import ProbeSpec
 
 
 def probe(spec: ProbeSpec, pid: int, state: dict[str, Any]) -> tuple[bool | None, dict]:

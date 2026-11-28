@@ -20,8 +20,8 @@ Basilisk II. The GuestOS module stays separate from that VMBackend concern.
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, LogRecord
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, LogRecord
 
 # Agent log/breadcrumb locations on the guest (classic colon paths). The agents
 # write these under the MacPython folder; they are fetched verbatim via read_file.

@@ -10,8 +10,8 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass, field
 
-from ..plugins.spec import PluginClaim
-from .types import DECLINE, Flow, Outcome, Rung
+from vmctl_core.plugins.spec import PluginClaim
+from vmctl_core.router.types import DECLINE, Flow, Outcome, Rung
 
 
 def claim_matches(claim: PluginClaim, flow: Flow) -> bool:

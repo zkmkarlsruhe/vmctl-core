@@ -33,8 +33,8 @@ import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from .backends.base import BackendError
-from .backends.libvirt_backend import virsh
+from vmctl_core.backends.base import BackendError
+from vmctl_core.backends.libvirt_backend import virsh
 
 #: second + third octet base — guest project nets live in 10.177.<idx>.0/24
 NET_SECOND_OCTET = 177

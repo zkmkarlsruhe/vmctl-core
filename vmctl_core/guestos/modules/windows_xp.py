@@ -8,8 +8,8 @@ Nothing here is called by the live controller yet.
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, CertProfile, EventRecord
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, CertProfile, EventRecord
 
 
 class WindowsXPModule(BaseGuestOSModule):

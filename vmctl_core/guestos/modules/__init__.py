@@ -8,14 +8,14 @@ controller code each method will absorb. Mac OS 9 declares almost nothing — it
 the proof the capability model degrades cleanly.
 """
 
-from .linux import LinuxModule
-from .mac_os_7 import MacOS7Module
-from .mac_os_9 import MacOS9Module
-from .mac_os_x import MacOSXModule, MacOSXTigerModule
-from .windows_7 import Windows7Module
-from .windows_2003 import Windows2003Module
-from .windows_modern import WindowsModernModule
-from .windows_xp import WindowsXPModule
+from vmctl_core.guestos.modules.linux import LinuxModule
+from vmctl_core.guestos.modules.mac_os_7 import MacOS7Module
+from vmctl_core.guestos.modules.mac_os_9 import MacOS9Module
+from vmctl_core.guestos.modules.mac_os_x import MacOSXModule, MacOSXTigerModule
+from vmctl_core.guestos.modules.windows_7 import Windows7Module
+from vmctl_core.guestos.modules.windows_2003 import Windows2003Module
+from vmctl_core.guestos.modules.windows_modern import WindowsModernModule
+from vmctl_core.guestos.modules.windows_xp import WindowsXPModule
 
 __all__ = [
     "LinuxModule",

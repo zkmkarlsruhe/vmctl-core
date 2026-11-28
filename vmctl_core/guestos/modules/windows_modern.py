@@ -11,8 +11,8 @@ therefore exposes only host log sources + the hypervisor-level controls.
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, CertProfile
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, CertProfile
 
 
 class WindowsModernModule(BaseGuestOSModule):

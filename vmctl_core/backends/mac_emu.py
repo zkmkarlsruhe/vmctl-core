@@ -54,9 +54,9 @@ from typing import ClassVar
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ..agentwire import AgentClient, Reply, TCPTransport, UnixTransport
-from ._agent import agent_session
-from .base import BackendError
+from vmctl_core.agentwire import AgentClient, Reply, TCPTransport, UnixTransport
+from vmctl_core.backends._agent import agent_session
+from vmctl_core.backends.base import BackendError, checked_snapshot_name
 
 
 # --- host tool + emulator configuration (env-overridable, NEVER hardcoded) -------
@@ -630,11 +630,9 @@ class _MacEmuBackend:
 
     # --- snapshots (COLD, disk-image copies — research/52 §6) -------------
     def _snap_path(self, name: str) -> Path:
-        return self.snapshots_dir / f"{name}.dsk"
+        return self.snapshots_dir / f"{checked_snapshot_name(name)}.dsk"
 
     def snapshot_list(self) -> list[str]:
-        if not self.snapshots_dir.exists():
-            return []
         return sorted(p.stem for p in self.snapshots_dir.glob("*.dsk"))
 
     def snapshot_create(self, name: str, *, memory: bool = True) -> None:
@@ -644,14 +642,15 @@ class _MacEmuBackend:
         Refuses while running: the emulator holds the volume open R/W, so a live
         copy captures a torn image. Mirrors ``snapshot_revert()``, which stops
         first before touching the .dsk (research/52 §6)."""
+        snap = self._snap_path(name)
         if self.is_running():
             raise BackendError(
                 f"refusing to snapshot {name!r} while running: the emulator holds "
                 "the .dsk open R/W (torn cold image) — stop the instance first"
             )
-        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
-        self._reflink_copy(Path(self.disk), self._snap_path(name))
-        nv = self._snap_path(name).with_suffix(".nvram")
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        self._reflink_copy(Path(self.disk), snap)
+        nv = snap.with_suffix(".nvram")
         nv.unlink(missing_ok=True)
         if self.nvram_path.exists():  # PRAM is part of the state (70b §3.4)
             self._reflink_copy(self.nvram_path, nv)
@@ -684,9 +683,10 @@ class _MacEmuBackend:
             self.start()
 
     def snapshot_delete(self, name: str) -> None:
-        self._snap_path(name).with_suffix(".nvram").unlink(missing_ok=True)
+        snap = self._snap_path(name)
+        snap.with_suffix(".nvram").unlink(missing_ok=True)
         try:
-            self._snap_path(name).unlink()
+            snap.unlink()
         except FileNotFoundError:
             raise BackendError(f"snapshot {name!r} not found") from None
 

@@ -35,8 +35,8 @@ from pathlib import Path
 
 import yaml
 
-from .atomicio import write_text_atomic
-from .drive import ArtworkDrive
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.drive import ArtworkDrive
 
 BUNDLE_FORMAT = 1
 BUNDLE_YAML = "bundle.yaml"
@@ -227,7 +227,7 @@ def create_process_bundle(
     exhibition controller supplies a real display; host media is copied, never linked.
     Executable media is recorded so zip transport can restore its executable bits.
     """
-    from .backends.process import SPEC_FILE, ProcessBackend, process_path
+    from vmctl_core.backends.process import SPEC_FILE, ProcessBackend, process_path
 
     instance = Path(instance_dir)
     backend = ProcessBackend(instance.name, instance_dir=instance)
@@ -309,7 +309,7 @@ def _digest_bytes(data: bytes) -> str:
 
 def _resolve_thin_base(bundle_dir: Path, catalog_path: str | Path) -> tuple[Path, str]:
     """Resolve+verify the golden base a thin bundle references. Returns (path, sha256)."""
-    from .catalog import BaseImage
+    from vmctl_core.catalog import BaseImage
 
     ref = read_yaml(bundle_dir / "vm" / "base.ref.yaml")
     want = ref.get("sha256") or ""
@@ -682,7 +682,7 @@ def unpack_bundle_zip(zip_path: str | Path, dest_dir: str | Path) -> Path:
     if vm.get("backend") == "process":
         if not verify_bundle(root)["ok"]:
             raise ValueError("unpacked process bundle failed checksum verification")
-        from .backends.process import ProcessSpec, process_path
+        from vmctl_core.backends.process import ProcessSpec, process_path
 
         definition = bundle_path(root, vm["artifact"]["path"])
         spec = ProcessSpec.model_validate_json(definition.read_text())

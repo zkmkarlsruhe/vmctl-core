@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 
-from .memory import Memory, Unreadable
+from vmctl_core.introspect.memory import Memory, Unreadable
 
 # Inside Macintosh: Operating System Utilities, Low-Memory Global Variables.
 SYS_VERSION, TICKS, ROM_BASE, CUR_AP_NAME = 0x15A, 0x16A, 0x2AE, 0x910

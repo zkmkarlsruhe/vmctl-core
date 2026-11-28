@@ -61,19 +61,19 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from ..agentwire import AgentClient, Reply, TCPTransport, UnixTransport
-from ..atomicio import write_text_atomic
-from ..paths import safe_segment
-from ._agent import AgentUnreachable, agent_session
-from .base import BackendError
-from .mac_emu import MacEmuSettings
+from vmctl_core.agentwire import AgentClient, Reply, TCPTransport, UnixTransport
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.backends._agent import AgentUnreachable, agent_session
+from vmctl_core.backends.base import BackendError, checked_snapshot_name
+from vmctl_core.backends.mac_emu import MacEmuSettings
+from vmctl_core.paths import safe_segment
 
 AGENT_PORT = 9009  # guest-side VA1 TCP port
 # classicvirtio declaration ROM inside the vmctl-emu/qemu-m68k images (absolute tablet)
 DECLROM_IN_IMAGE = "/usr/local/share/vmctl/classicvirtio-declrom"
-_SNAP_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # AF_UNIX sun_path is 108 bytes on Linux; QEMU fails late and cryptically past it.
 _SUN_PATH_MAX = 107
+_SNAP_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")  # one HMP token for savevm
 
 # Per-instance locks shared by every Q800Backend object bound to the same directory:
 # the controller builds a fresh backend per request, and both QMP (one client at a time)
@@ -1000,7 +1000,7 @@ class Q800Backend:
 
     # --- snapshots (internal qcow2: disk + PRAM, with RAM when live) -----
     def _check_snap(self, name: str) -> str:
-        if not _SNAP_NAME.match(name or ""):
+        if not _SNAP_NAME.fullmatch(checked_snapshot_name(name)):
             raise BackendError(f"invalid snapshot name {name!r} (allowed: A-Z a-z 0-9 . _ -)")
         return name
 

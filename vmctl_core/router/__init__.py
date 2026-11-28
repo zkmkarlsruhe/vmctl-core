@@ -6,14 +6,14 @@ Flow/Rung/outcome primitives and ``router`` for the ladder walk + claim conflict
 
 from __future__ import annotations
 
-from .router import (
+from vmctl_core.router.router import (
     ClaimConflictError,
     Router,
     claim_matches,
     claims_overlap,
     detect_claim_conflicts,
 )
-from .types import DECLINE, Flow, Handled, Outcome, Rung, Terminal
+from vmctl_core.router.types import DECLINE, Flow, Handled, Outcome, Rung, Terminal
 
 __all__ = [
     "DECLINE",

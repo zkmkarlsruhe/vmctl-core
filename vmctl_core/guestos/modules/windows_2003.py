@@ -12,7 +12,7 @@ a SHA-256 / TLS1.2 profile — which a pre-patch 2003 guest cannot validate thro
 
 from __future__ import annotations
 
-from .windows_xp import WindowsXPModule
+from vmctl_core.guestos.modules.windows_xp import WindowsXPModule
 
 
 class Windows2003Module(WindowsXPModule):

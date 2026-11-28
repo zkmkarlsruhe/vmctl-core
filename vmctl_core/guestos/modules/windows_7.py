@@ -8,8 +8,8 @@ in `cert_profile`; the behaviour bodies are otherwise the Windows family's.
 
 from __future__ import annotations
 
-from ..capabilities import Capabilities, Capability
-from ..contract import BaseGuestOSModule, CertProfile
+from vmctl_core.guestos.capabilities import Capabilities, Capability
+from vmctl_core.guestos.contract import BaseGuestOSModule, CertProfile
 
 
 class Windows7Module(BaseGuestOSModule):

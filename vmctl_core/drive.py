@@ -34,9 +34,9 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-from .atomicio import write_text_atomic
-from .network_config import NETWORK_CONFIG_NAME, NetworkConfig
-from .paths import safe_segment
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.network_config import NETWORK_CONFIG_NAME, NetworkConfig
+from vmctl_core.paths import safe_segment
 
 STAGES = ("intake", "analysis", "workbench", "exhibition")
 

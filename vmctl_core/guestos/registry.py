@@ -9,7 +9,7 @@ longest-prefix over each module's ``os_labels`` so "windows-xp" beats a generic
 
 from __future__ import annotations
 
-from .contract import GuestOSModule
+from vmctl_core.guestos.contract import GuestOSModule
 
 
 class GuestOSRegistry:
@@ -52,7 +52,7 @@ default_registry = GuestOSRegistry()
 def _populate_default_registry() -> None:
     # imported here (not at module top) so registry.py has no import cycle with the
     # modules, which import contract/capabilities.
-    from .modules import (
+    from vmctl_core.guestos.modules import (
         LinuxModule,
         MacOS7Module,
         MacOS9Module,

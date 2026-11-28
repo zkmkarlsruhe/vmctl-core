@@ -8,8 +8,8 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from threading import Lock
 
-from ..agentwire import AgentClient, AgentError, SocketTransport, _va1
-from .base import BackendError
+from vmctl_core.agentwire import AgentClient, AgentError, SocketTransport, _va1
+from vmctl_core.backends.base import BackendError
 
 
 class AgentUnreachable(BackendError):

@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import inspect
 
-from .runtime import PluginRegistry
-from .spec import MANIFEST_FILENAME, PluginManifest
+from vmctl_core.plugins.runtime import PluginRegistry
+from vmctl_core.plugins.spec import MANIFEST_FILENAME, PluginManifest
 
 # Hand-written one-liners for each registration method (what to register + when it
 # fires). Keys must match PluginRegistry.register_* method names; verified by a test

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from .memory import Memory, Unreadable
+from vmctl_core.introspect.memory import Memory, Unreadable
 
 # Amiga NDK 3.1: exec/nodes.h, exec/lists.h (byte offsets, big endian).
 LN_SUCC, LN_PRED, LN_TYPE, LN_PRI, LN_NAME = 0, 4, 8, 9, 10

@@ -13,8 +13,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from .atomicio import write_text_atomic
-from .instance import VMInstance
+from vmctl_core.atomicio import write_text_atomic
+from vmctl_core.instance import VMInstance
 
 
 class Project(BaseModel):

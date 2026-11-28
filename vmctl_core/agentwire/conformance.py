@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from . import _va1
-from .client import AgentClient, AgentError, Arguments, Hello, encode_arguments
-from .fakeagent import CATALOG, REQUIRED_TOOLS
-from .images import UnsupportedImageFormat, image_header
-from .transports import Connection, TCPTransport, UnixTransport, transport_for
+from vmctl_core.agentwire import _va1
+from vmctl_core.agentwire.client import AgentClient, AgentError, Arguments, Hello, encode_arguments
+from vmctl_core.agentwire.fakeagent import CATALOG, REQUIRED_TOOLS
+from vmctl_core.agentwire.images import UnsupportedImageFormat, image_header
+from vmctl_core.agentwire.transports import Connection, TCPTransport, UnixTransport, transport_for
 
 
 @dataclass(frozen=True)

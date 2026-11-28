@@ -13,17 +13,22 @@ only to this Protocol so the same code runs against different substrates:
 ``hw.backend`` field (research/52 §3), replacing the hardcoded ``LibvirtBackend``.
 """
 
-from .base import BackendError, VMBackend
-from .libvirt_backend import LibvirtBackend
-from .mac_emu import (
+from vmctl_core.backends.base import BackendError, VMBackend
+from vmctl_core.backends.libvirt_backend import LibvirtBackend
+from vmctl_core.backends.mac_emu import (
     BasiliskIIBackend,
     MacEmuSettings,
     SheepShaverBackend,
     render_prefs,
 )
-from .process import ProbeSpec, ProcessBackend, ProcessSpec, clone_process
-from .qemu_q800 import AgentUnreachable, Q800Backend, clone_q800, q800_spec
-from .registry import backend_for, is_mac_emu, is_process_backend, resolve_backend_kind
+from vmctl_core.backends.process import ProbeSpec, ProcessBackend, ProcessSpec, clone_process
+from vmctl_core.backends.qemu_q800 import AgentUnreachable, Q800Backend, clone_q800, q800_spec
+from vmctl_core.backends.registry import (
+    backend_for,
+    is_mac_emu,
+    is_process_backend,
+    resolve_backend_kind,
+)
 
 __all__ = [
     "AgentUnreachable",
